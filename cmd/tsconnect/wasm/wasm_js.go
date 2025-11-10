@@ -1,3 +1,5 @@
+//go:build js && wasm
+
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
@@ -6,7 +8,7 @@
 //
 // When run in the browser, a newIPN(config) function is added to the global JS
 // namespace. When called it returns an ipn object with the methods
-// run(callbacks), login(), logout(), and ssh(...).
+// run(callbacks), login(), logout(), ssh(...), fetch(...), and getPeers().
 package main
 
 import (
@@ -47,16 +49,17 @@ import (
 // ControlURL defines the URL to be used for connection to Control.
 var ControlURL = ipn.DefaultControlURL
 
+var jsGlobal = js.Global()
+
 func main() {
-	js.Global().Set("newIPN", js.FuncOf(func(this js.Value, args []js.Value) any {
+	jsGlobal.Set("newIPN", js.FuncOf(func(this js.Value, args []js.Value) any {
 		if len(args) != 1 {
 			log.Fatal("Usage: newIPN(config)")
 			return nil
 		}
 		return newIPN(args[0])
 	}))
-	// Keep Go runtime alive, otherwise it will be shut down before newIPN gets
-	// called.
+	// Keep Go runtime alive, otherwise it will be shut down before newIPN gets called.
 	<-make(chan bool)
 }
 
@@ -67,8 +70,7 @@ func newIPN(jsConfig js.Value) map[string]any {
 	if jsStateStorage.IsUndefined() {
 		panic("stateStorage must be provided for persistent Tailscale identity")
 	}
-
-	store := &jsStateStore{jsStateStorage}
+	store := &jsStateStore{jsStateStorage: jsStateStorage}
 
 	controlURL := ControlURL
 	if jsControlURL := jsConfig.Get("controlURL"); jsControlURL.Type() == js.TypeString {
@@ -91,12 +93,9 @@ func newIPN(jsConfig js.Value) map[string]any {
 	c := logtail.Config{
 		Collection: lpc.Collection,
 		PrivateID:  lpc.PrivateID,
-
-		// Compressed requests set HTTP headers that are not supported by the
-		// no-cors fetching mode:
+		// Compressed requests set HTTP headers that are not supported by the no-cors fetching mode:
 		CompressLogs: false,
-
-		HTTPC: &http.Client{Transport: &noCORSTransport{http.DefaultTransport}},
+		HTTPC:        &http.Client{Transport: &noCORSTransport{http.DefaultTransport}},
 	}
 	logtail := logtail.NewLogger(c, log.Printf)
 	logf := logtail.Logf
@@ -105,6 +104,7 @@ func newIPN(jsConfig js.Value) map[string]any {
 	sys.Set(store)
 	dialer := &tsdial.Dialer{Logf: logf}
 	dialer.SetBus(sys.Bus.Get())
+
 	eng, err := wgengine.NewUserspaceEngine(logf, wgengine.Config{
 		Dialer:        dialer,
 		SetSubsystem:  sys.Set,
@@ -126,9 +126,7 @@ func newIPN(jsConfig js.Value) map[string]any {
 	ns.ProcessLocalIPs = true
 	ns.ProcessSubnets = true
 
-	dialer.UseNetstackForIP = func(ip netip.Addr) bool {
-		return true
-	}
+	dialer.UseNetstackForIP = func(ip netip.Addr) bool { return true }
 	dialer.NetstackDialTCP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
 		return ns.DialContextTCP(ctx, dst)
 	}
@@ -149,7 +147,7 @@ func newIPN(jsConfig js.Value) map[string]any {
 	}
 	srv.SetLocalBackend(lb)
 
-	jsIPN := &jsIPN{
+	ipnObj := &jsIPN{
 		dialer:     dialer,
 		srv:        srv,
 		lb:         lb,
@@ -162,14 +160,14 @@ func newIPN(jsConfig js.Value) map[string]any {
 		"run": js.FuncOf(func(this js.Value, args []js.Value) any {
 			if len(args) != 1 {
 				log.Fatal(`Usage: run({
-					notifyState(state: int): void,
-					notifyNetMap(netMap: object): void,
+					notifyState(state: string): void,
+					notifyNetMap(netMapJSON: string): void,
 					notifyBrowseToURL(url: string): void,
 					notifyPanicRecover(err: string): void,
 				})`)
 				return nil
 			}
-			jsIPN.run(args[0])
+			ipnObj.run(args[0])
 			return nil
 		}),
 		"login": js.FuncOf(func(this js.Value, args []js.Value) any {
@@ -177,7 +175,7 @@ func newIPN(jsConfig js.Value) map[string]any {
 				log.Printf("Usage: login()")
 				return nil
 			}
-			jsIPN.login()
+			ipnObj.login()
 			return nil
 		}),
 		"logout": js.FuncOf(func(this js.Value, args []js.Value) any {
@@ -185,7 +183,7 @@ func newIPN(jsConfig js.Value) map[string]any {
 				log.Printf("Usage: logout()")
 				return nil
 			}
-			jsIPN.logout()
+			ipnObj.logout()
 			return nil
 		}),
 		"ssh": js.FuncOf(func(this js.Value, args []js.Value) any {
@@ -193,30 +191,28 @@ func newIPN(jsConfig js.Value) map[string]any {
 				log.Printf("Usage: ssh(hostname, userName, termConfig)")
 				return nil
 			}
-			return jsIPN.ssh(
-				args[0].String(),
-				args[1].String(),
-				args[2])
+			return ipnObj.ssh(args[0].String(), args[1].String(), args[2])
 		}),
 		"fetch": js.FuncOf(func(this js.Value, args []js.Value) any {
 			if len(args) != 1 {
 				log.Printf("Usage: fetch(request)")
 				return nil
 			}
-
-			request := args[0]
-			return jsIPN.fetch(request)
+			return ipnObj.fetch(args[0])
 		}),
+		// Bind method value directly; signature matches js.FuncOf required shape.
+		"getPeers": js.FuncOf(ipnObj.GetPeers),
 	}
 }
 
 type jsIPN struct {
-	dialer     *tsdial.Dialer
-	srv        *ipnserver.Server
-	lb         *ipnlocal.LocalBackend
-	controlURL string
-	authKey    string
-	hostname   string
+	lastNetmapJSON string
+	dialer         *tsdial.Dialer
+	srv            *ipnserver.Server
+	lb             *ipnlocal.LocalBackend
+	controlURL     string
+	authKey        string
+	hostname       string
 }
 
 var jsIPNState = map[ipn.State]string{
@@ -243,10 +239,6 @@ func (i *jsIPN) run(jsCallbacks js.Value) {
 	notifyState(ipn.NoState)
 
 	i.lb.SetNotifyCallback(func(n ipn.Notify) {
-		// Panics in the notify callback are likely due to be due to bugs in
-		// this bridging module (as opposed to actual bugs in Tailscale) and
-		// thus may be recoverable. Let the UI know, and allow the user to
-		// choose if they want to reload the page.
 		defer func() {
 			if r := recover(); r != nil {
 				fmt.Println("Panic recovered:", r)
@@ -271,7 +263,6 @@ func (i *jsIPN) run(jsCallbacks js.Value) {
 				Peers: mapSlice(nm.Peers, func(p tailcfg.NodeView) jsNetMapPeerNode {
 					name := p.Name()
 					if name == "" {
-						// In practice this should only happen for Hello.
 						name = p.Hostinfo().Hostname()
 					}
 					addrs := make([]string, p.Addresses().Len())
@@ -292,7 +283,8 @@ func (i *jsIPN) run(jsCallbacks js.Value) {
 				LockedOut: nm.TKAEnabled && nm.SelfNode.KeySignature().Len() == 0,
 			}
 			if jsonNetMap, err := json.Marshal(jsNetMap); err == nil {
-				jsCallbacks.Call("notifyNetMap", string(jsonNetMap))
+				i.lastNetmapJSON = string(jsonNetMap) // store for getPeers
+				jsCallbacks.Call("notifyNetMap", i.lastNetmapJSON)
 			} else {
 				log.Printf("Could not generate JSON netmap: %v", err)
 			}
@@ -322,10 +314,19 @@ func (i *jsIPN) run(jsCallbacks js.Value) {
 		if err != nil {
 			log.Fatalf("safesocket.Listen: %v", err)
 		}
-
 		err = i.srv.Run(context.Background(), ln)
 		log.Fatalf("ipnserver.Run exited: %v", err)
 	}()
+}
+
+// GetPeers is exported to JS as ipn.getPeers()
+func (i *jsIPN) GetPeers(this js.Value, args []js.Value) any {
+	if i.lastNetmapJSON == "" {
+		// return []
+		return js.ValueOf(make([]any, 0))
+	}
+	parsed := jsGlobal.Get("JSON").Call("parse", i.lastNetmapJSON)
+	return parsed.Get("peers")
 }
 
 func (i *jsIPN) login() {
@@ -350,9 +351,7 @@ func (i *jsIPN) ssh(host, username string, termConfig js.Value) map[string]any {
 		username:   username,
 		termConfig: termConfig,
 	}
-
 	go jsSSHSession.Run()
-
 	return map[string]any{
 		"close": js.FuncOf(func(this js.Value, args []js.Value) any {
 			return jsSSHSession.Close() != nil
@@ -391,12 +390,8 @@ func (s *jsSSHSession) Run() {
 	onDone := s.termConfig.Get("onDone")
 	defer onDone.Invoke()
 
-	writeError := func(label string, err error) {
-		writeErrorFn.Invoke(fmt.Sprintf("%s Error: %v\r\n", label, err))
-	}
-	reportProgress := func(message string) {
-		onConnectionProgress.Invoke(message)
-	}
+	writeError := func(label string, err error) { writeErrorFn.Invoke(fmt.Sprintf("%s Error: %v\r\n", label, err)) }
+	reportProgress := func(message string) { onConnectionProgress.Invoke(message) }
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds*float64(time.Second)))
 	defer cancel()
@@ -410,8 +405,6 @@ func (s *jsSSHSession) Run() {
 
 	config := &ssh.ClientConfig{
 		HostKeyCallback: func(hostname string, remote net.Addr, key ssh.PublicKey) error {
-			// Host keys are not used with Tailscale SSH, but we can use this
-			// callback to know that the connection has been established.
 			reportProgress("SSH connection established…")
 			return nil
 		},
@@ -443,8 +436,8 @@ func (s *jsSSHSession) Run() {
 		return
 	}
 
-	session.Stdout = termWriter{writeFn}
-	session.Stderr = termWriter{writeFn}
+	session.Stdout = termWriter{f: writeFn}
+	session.Stderr = termWriter{f: writeFn}
 
 	setReadFn.Invoke(js.FuncOf(func(this js.Value, args []js.Value) any {
 		input := args[0].String()
@@ -455,29 +448,24 @@ func (s *jsSSHSession) Run() {
 		return nil
 	}))
 
-	// We might have gotten a resize notification since we started opening the
-	// session, pick up the latest size.
+	// pick up latest size if we got a resize before the session opened
 	if s.pendingResizeRows != 0 {
 		rows = s.pendingResizeRows
 	}
 	if s.pendingResizeCols != 0 {
 		cols = s.pendingResizeCols
 	}
-	err = session.RequestPty("xterm", rows, cols, ssh.TerminalModes{})
-	if err != nil {
+	if err := session.RequestPty("xterm", rows, cols, ssh.TerminalModes{}); err != nil {
 		writeError("Pseudo Terminal", err)
 		return
 	}
-
-	err = session.Shell()
-	if err != nil {
+	if err := session.Shell(); err != nil {
 		writeError("Shell", err)
 		return
 	}
 
 	onConnected.Invoke()
-	err = session.Wait()
-	if err != nil {
+	if err := session.Wait(); err != nil {
 		writeError("Wait", err)
 		return
 	}
@@ -485,7 +473,6 @@ func (s *jsSSHSession) Run() {
 
 func (s *jsSSHSession) Close() error {
 	if s.session == nil {
-		// We never had a chance to open the session, ignore the close request.
 		return nil
 	}
 	return s.session.Close()
@@ -500,137 +487,7 @@ func (s *jsSSHSession) Resize(rows, cols int) error {
 	return s.session.WindowChange(rows, cols)
 }
 
-func createReadableStreamFromBytes(b []byte) js.Value {
-	uint8Arr := js.Global().Get("Uint8Array").New(len(b))
-	js.CopyBytesToJS(uint8Arr, b)
-
-	constructor := js.Global().Get("ReadableStream")
-	queuingStrategy := js.Global().Get("Object").New()
-
-	source := js.Global().Get("Object").New()
-	source.Set("start", js.FuncOf(func(this js.Value, args []js.Value) any {
-		controller := args[0]
-		controller.Call("enqueue", uint8Arr)
-		controller.Call("close")
-		return nil
-	}))
-
-	return constructor.New(source, queuingStrategy)
-}
-
-func newEmptyReadableStream() js.Value {
-	constructor := js.Global().Get("ReadableStream")
-	source := js.Global().Get("Object").New()
-	source.Set("start", js.FuncOf(func(this js.Value, args []js.Value) any {
-		controller := args[0]
-		controller.Call("close")
-		return nil
-	}))
-	return constructor.New(source)
-}
-
-// createResponseObject creates a response object with all methods including clone
-func (i *jsIPN) createResponseObject(statusCode int, status, statusText string, headers map[string]any, data []byte) map[string]any {
-	stream := createReadableStreamFromBytes(data)
-	return map[string]any{
-		"status":     statusCode,
-		"ok":         statusCode >= 200 && statusCode < 300,
-		"statusText": statusText,
-		"headers":    headers,
-		"body":       stream,
-		"text": js.FuncOf(func(this js.Value, args []js.Value) any {
-			return makePromise(func() (any, error) {
-				return string(data), nil
-			})
-		}),
-		"json": js.FuncOf(func(this js.Value, args []js.Value) any {
-			return makePromise(func() (any, error) {
-				var v any
-				if err := json.Unmarshal(data, &v); err != nil {
-					return nil, err
-				}
-				return v, nil
-			})
-		}),
-		"clone": js.FuncOf(func(this js.Value, args []js.Value) any {
-			return makePromise(func() (any, error) {
-				return i.createResponseObject(statusCode, status, statusText, headers, data), nil
-			})
-		}),
-	}
-}
-
-func (i *jsIPN) fetch(request js.Value) js.Value {
-	return makePromise(func() (any, error) {
-		c := &http.Client{
-			Transport: &http.Transport{DialContext: i.dialer.UserDial},
-		}
-
-		url := request.Get("url").String()
-
-		method := "GET"
-		if m := request.Get("method"); m.Truthy() {
-			method = strings.ToUpper(m.String())
-		}
-
-		var r io.Reader = http.NoBody
-		if b := request.Get("body"); b.Truthy() && b.String() != "" {
-			r = strings.NewReader(b.String())
-		}
-
-		req, err := http.NewRequest(method, url, r)
-		if err != nil {
-			return nil, err
-		}
-
-		// copy headers
-		if headers := request.Get("headers"); headers.Truthy() {
-			keys := js.Global().Get("Object").Call("keys", headers)
-			for j := 0; j < keys.Length(); j++ {
-				k := keys.Index(j).String()
-				v := headers.Get(k).String()
-				req.Header.Set(k, v)
-			}
-		}
-
-		// Do request
-		res, err := c.Do(req)
-		if err != nil {
-			return map[string]any{
-				"status": 0,
-				"ok":     false,
-				"text": js.FuncOf(func(this js.Value, args []js.Value) any {
-					return makePromise(func() (any, error) {
-						return "", nil
-					})
-				}),
-				"body": newEmptyReadableStream(),
-			}, nil
-		}
-		defer res.Body.Close()
-
-		var buf bytes.Buffer
-		_, readErr := buf.ReadFrom(res.Body)
-		data := buf.Bytes()
-
-		if readErr != nil {
-			return nil, readErr
-		}
-
-		headers := map[string]any{}
-		for k, v := range res.Header {
-			if len(v) > 0 {
-				headers[k] = v[0]
-			}
-		}
-
-		return i.createResponseObject(res.StatusCode, res.Status, res.Status, headers, data), nil
-	})
-}
-
-type termWriter struct {
-	f js.Value
-}
+type termWriter struct{ f js.Value }
 
 func (w termWriter) Write(p []byte) (n int, err error) {
 	r := bytes.Replace(p, []byte("\n"), []byte("\n\r"), -1)
@@ -679,6 +536,131 @@ func (s *jsStateStore) WriteState(id ipn.StateKey, bs []byte) error {
 	return nil
 }
 
+func createReadableStreamFromBytes(b []byte) js.Value {
+	uint8Arr := jsGlobal.Get("Uint8Array").New(len(b))
+	js.CopyBytesToJS(uint8Arr, b)
+
+	constructor := jsGlobal.Get("ReadableStream")
+	queuingStrategy := jsGlobal.Get("Object").New()
+
+	source := jsGlobal.Get("Object").New()
+	source.Set("start", js.FuncOf(func(this js.Value, args []js.Value) any {
+		controller := args[0]
+		controller.Call("enqueue", uint8Arr)
+		controller.Call("close")
+		return nil
+	}))
+
+	return constructor.New(source, queuingStrategy)
+}
+
+func newEmptyReadableStream() js.Value {
+	constructor := jsGlobal.Get("ReadableStream")
+	source := jsGlobal.Get("Object").New()
+	source.Set("start", js.FuncOf(func(this js.Value, args []js.Value) any {
+		controller := args[0]
+		controller.Call("close")
+		return nil
+	}))
+	return constructor.New(source)
+}
+
+func (i *jsIPN) createResponseObject(statusCode int, status, statusText string, headers map[string]any, data []byte) map[string]any {
+	stream := createReadableStreamFromBytes(data)
+	return map[string]any{
+		"status":     statusCode,
+		"ok":         statusCode >= 200 && statusCode < 300,
+		"statusText": statusText,
+		"headers":    headers,
+		"body":       stream,
+		"text": js.FuncOf(func(this js.Value, args []js.Value) any {
+			return makePromise(func() (any, error) { return string(data), nil })
+		}),
+		"json": js.FuncOf(func(this js.Value, args []js.Value) any {
+			return makePromise(func() (any, error) {
+				var v any
+				if len(data) == 0 {
+					return nil, nil
+				}
+				if err := json.Unmarshal(data, &v); err != nil {
+					return nil, err
+				}
+				return v, nil
+			})
+		}),
+		"clone": js.FuncOf(func(this js.Value, args []js.Value) any {
+			return makePromise(func() (any, error) {
+				clone := make([]byte, len(data))
+				copy(clone, data)
+				return i.createResponseObject(statusCode, status, statusText, headers, clone), nil
+			})
+		}),
+	}
+}
+
+func (i *jsIPN) fetch(request js.Value) js.Value {
+	return makePromise(func() (any, error) {
+		c := &http.Client{
+			Transport: &http.Transport{DialContext: i.dialer.UserDial},
+		}
+
+		url := request.Get("url").String()
+		method := "GET"
+		if m := request.Get("method"); m.Truthy() {
+			method = strings.ToUpper(m.String())
+		}
+
+		var r io.Reader = http.NoBody
+		if b := request.Get("body"); b.Truthy() && b.String() != "" {
+			r = strings.NewReader(b.String())
+		}
+
+		req, err := http.NewRequest(method, url, r)
+		if err != nil {
+			return nil, err
+		}
+
+		// Copy headers
+		if headers := request.Get("headers"); headers.Truthy() {
+			keys := jsGlobal.Get("Object").Call("keys", headers)
+			for j := 0; j < keys.Length(); j++ {
+				k := keys.Index(j).String()
+				v := headers.Get(k).String()
+				req.Header.Set(k, v)
+			}
+		}
+
+		// Do request
+		res, err := c.Do(req)
+		if err != nil {
+			return map[string]any{
+				"status": 0,
+				"ok":     false,
+				"text": js.FuncOf(func(this js.Value, args []js.Value) any {
+					return makePromise(func() (any, error) { return "", nil })
+				}),
+				"body": newEmptyReadableStream(),
+			}, nil
+		}
+		defer res.Body.Close()
+
+		var buf bytes.Buffer
+		if _, err := buf.ReadFrom(res.Body); err != nil {
+			return nil, err
+		}
+		data := buf.Bytes()
+
+		headers := map[string]any{}
+		for k, v := range res.Header {
+			if len(v) > 0 {
+				headers[k] = v[0]
+			}
+		}
+
+		return i.createResponseObject(res.StatusCode, res.Status, res.Status, headers, data), nil
+	})
+}
+
 func mapSlice[T any, M any](a []T, f func(T) M) []M {
 	n := make([]M, len(a))
 	for i, e := range a {
@@ -717,15 +699,12 @@ func generateHostname() string {
 		tails = filterSlice(tails, func(s string) bool { return strings.HasPrefix(s, "w") })
 		scales = filterSlice(scales, func(s string) bool { return strings.HasPrefix(s, "a") })
 	}
-
 	tail := tails[rand.IntN(len(tails))]
 	scale := scales[rand.IntN(len(scales))]
 	return fmt.Sprintf("%s-%s", tail, scale)
 }
 
 // makePromise handles the boilerplate of wrapping goroutines with JS promises.
-// f is run on a goroutine and its return value is used to resolve the promise
-// (or reject it if an error is returned).
 func makePromise(f func() (any, error)) js.Value {
 	handler := js.FuncOf(func(this js.Value, args []js.Value) any {
 		resolve := args[0]
@@ -739,9 +718,7 @@ func makePromise(f func() (any, error)) js.Value {
 		}()
 		return nil
 	})
-
-	promiseConstructor := js.Global().Get("Promise")
-	return promiseConstructor.New(handler)
+	return jsGlobal.Get("Promise").New(handler)
 }
 
 const logPolicyStateKey = "log-policy"
@@ -763,18 +740,14 @@ func getOrCreateLogPolicyConfig(state ipn.StateStore) *logpolicy.Config {
 	return config
 }
 
-// noCORSTransport wraps a RoundTripper and forces the no-cors mode on requests,
-// so that we can use it with non-CORS-aware servers.
-type noCORSTransport struct {
-	http.RoundTripper
-}
+// noCORSTransport wraps a RoundTripper and forces the no-cors mode on requests.
+type noCORSTransport struct{ http.RoundTripper }
 
 func (t *noCORSTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	req.Header.Set("js.fetch:mode", "no-cors")
 	resp, err := t.RoundTripper.RoundTrip(req)
 	if err == nil {
-		// In no-cors mode no response properties are returned. Populate just
-		// the status so that callers do not think this was an error.
+		// In no-cors mode no response properties are returned. Populate just the status.
 		resp.StatusCode = http.StatusOK
 		resp.Status = http.StatusText(http.StatusOK)
 	}

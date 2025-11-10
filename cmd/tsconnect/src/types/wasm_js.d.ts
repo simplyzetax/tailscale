@@ -24,6 +24,8 @@ declare global {
     run(callbacks: IPNCallbacks): void
     login(): void
     logout(): void
+
+    /** Start a Tailscale SSH session */
     ssh(
       host: string,
       username: string,
@@ -40,7 +42,15 @@ declare global {
         onDone: () => void
       }
     ): IPNSSHSession
+
+    /** Tailscale-style fetch through the tunnel */
     fetch(request: Request): Promise<IPNResponse>
+
+    /** Returns list of all known peers from the current NetMap */
+    getPeers(): IPNNetMapPeerNode[]
+
+    /** Returns the local node's NetMap info */
+    getSelf(): IPNNetMapSelfNode | null
   }
 
   interface IPNSSHSession {
@@ -85,6 +95,7 @@ declare global {
   }
 
   type IPNNetMapPeerNode = IPNNetMapNode & {
+    /** online property is optional exactly like Tailscale's online pointer */
     online?: boolean
     tailscaleSSHEnabled: boolean
   }
