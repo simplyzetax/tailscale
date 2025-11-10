@@ -30,7 +30,6 @@ import (
 	"tailscale.com/ipn/ipnauth"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/ipnserver"
-	"tailscale.com/ipn/store/mem"
 	"tailscale.com/logpolicy"
 	"tailscale.com/logtail"
 	"tailscale.com/net/netns"
@@ -63,12 +62,12 @@ func main() {
 func newIPN(jsConfig js.Value) map[string]any {
 	netns.SetEnabled(false)
 
-	var store ipn.StateStore
-	if jsStateStorage := jsConfig.Get("stateStorage"); !jsStateStorage.IsUndefined() {
-		store = &jsStateStore{jsStateStorage}
-	} else {
-		store = new(mem.Store)
+	jsStateStorage := jsConfig.Get("stateStorage")
+	if jsStateStorage.IsUndefined() {
+		panic("stateStorage must be provided for persistent Tailscale identity")
 	}
+
+	store := &jsStateStore{jsStateStorage}
 
 	controlURL := ControlURL
 	if jsControlURL := jsConfig.Get("controlURL"); jsControlURL.Type() == js.TypeString {
@@ -512,9 +511,17 @@ func (i *jsIPN) fetch(url string) js.Value {
 			return nil, err
 		}
 
+		headers := make(map[string]any)
+		for key, values := range res.Header {
+			if len(values) > 0 {
+				headers[key] = values[0] // Use the first value for each header
+			}
+		}
+
 		return map[string]any{
 			"status":     res.StatusCode,
 			"statusText": res.Status,
+			"headers":    headers,
 			"text": js.FuncOf(func(this js.Value, args []js.Value) any {
 				return makePromise(func() (any, error) {
 					defer res.Body.Close()
@@ -525,7 +532,6 @@ func (i *jsIPN) fetch(url string) js.Value {
 					return buf.String(), nil
 				})
 			}),
-			// TODO: populate a more complete JS Response object
 		}, nil
 	})
 }
