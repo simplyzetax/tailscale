@@ -508,7 +508,18 @@ func (i *jsIPN) fetch(url string) js.Value {
 		}
 		res, err := c.Get(url)
 		if err != nil {
-			return nil, err
+			// Return a response-like object for network errors instead of throwing
+			return map[string]any{
+				"status":     0,
+				"statusText": err.Error(),
+				"headers":    make(map[string]any),
+				"ok":         false,
+				"text": js.FuncOf(func(this js.Value, args []js.Value) any {
+					return makePromise(func() (any, error) {
+						return "", nil
+					})
+				}),
+			}, nil
 		}
 
 		headers := make(map[string]any)
@@ -518,10 +529,13 @@ func (i *jsIPN) fetch(url string) js.Value {
 			}
 		}
 
+		ok := res.StatusCode >= 200 && res.StatusCode < 300
+
 		return map[string]any{
 			"status":     res.StatusCode,
 			"statusText": res.Status,
 			"headers":    headers,
+			"ok":         ok,
 			"text": js.FuncOf(func(this js.Value, args []js.Value) any {
 				return makePromise(func() (any, error) {
 					defer res.Body.Close()
