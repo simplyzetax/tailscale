@@ -9,6 +9,17 @@
 declare global {
   function newIPN(config: IPNConfig): IPN
 
+  interface IPNResponse {
+    status: number
+    statusText: string
+    text: () => Promise<string>
+    json: () => Promise<unknown>
+    body: ReadableStream
+    headers: Record<string, string>
+    ok: boolean
+    clone: () => Promise<this>
+  }
+
   interface IPN {
     run(callbacks: IPNCallbacks): void
     login(): void
@@ -29,15 +40,7 @@ declare global {
         onDone: () => void
       }
     ): IPNSSHSession
-    fetch(request: Request): Promise<{
-      status: number
-      statusText: string
-      text: () => Promise<string>
-      json: () => Promise<unknown>
-      body: ReadableStream
-      headers: Record<string, string>
-      ok: boolean
-    }>
+    fetch(request: Request): Promise<IPNResponse>
   }
 
   interface IPNSSHSession {

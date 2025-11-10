@@ -529,6 +529,37 @@ func newEmptyReadableStream() js.Value {
 	return constructor.New(source)
 }
 
+// createResponseObject creates a response object with all methods including clone
+func (i *jsIPN) createResponseObject(statusCode int, status, statusText string, headers map[string]any, data []byte) map[string]any {
+	stream := createReadableStreamFromBytes(data)
+	return map[string]any{
+		"status":     statusCode,
+		"ok":         statusCode >= 200 && statusCode < 300,
+		"statusText": statusText,
+		"headers":    headers,
+		"body":       stream,
+		"text": js.FuncOf(func(this js.Value, args []js.Value) any {
+			return makePromise(func() (any, error) {
+				return string(data), nil
+			})
+		}),
+		"json": js.FuncOf(func(this js.Value, args []js.Value) any {
+			return makePromise(func() (any, error) {
+				var v any
+				if err := json.Unmarshal(data, &v); err != nil {
+					return nil, err
+				}
+				return v, nil
+			})
+		}),
+		"clone": js.FuncOf(func(this js.Value, args []js.Value) any {
+			return makePromise(func() (any, error) {
+				return i.createResponseObject(statusCode, status, statusText, headers, data), nil
+			})
+		}),
+	}
+}
+
 func (i *jsIPN) fetch(request js.Value) js.Value {
 	return makePromise(func() (any, error) {
 		c := &http.Client{
@@ -593,29 +624,7 @@ func (i *jsIPN) fetch(request js.Value) js.Value {
 			}
 		}
 
-		stream := createReadableStreamFromBytes(data)
-
-		return map[string]any{
-			"status":     res.StatusCode,
-			"ok":         res.StatusCode >= 200 && res.StatusCode < 300,
-			"statusText": res.Status,
-			"headers":    headers,
-			"body":       stream,
-			"text": js.FuncOf(func(this js.Value, args []js.Value) any {
-				return makePromise(func() (any, error) {
-					return string(data), nil
-				})
-			}),
-			"json": js.FuncOf(func(this js.Value, args []js.Value) any {
-				return makePromise(func() (any, error) {
-					var v any
-					if err := json.Unmarshal(data, &v); err != nil {
-						return nil, err
-					}
-					return v, nil
-				})
-			}),
-		}, nil
+		return i.createResponseObject(res.StatusCode, res.Status, res.Status, headers, data), nil
 	})
 }
 
