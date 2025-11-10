@@ -12,8 +12,8 @@ declare global {
   interface IPNResponse {
     status: number
     statusText: string
-    text: () => Promise<string>
-    json: () => Promise<unknown>
+    text: () => Promise<string | null>
+    json: () => Promise<unknown | null>
     body: ReadableStream
     headers: Record<string, string>
     ok: boolean
