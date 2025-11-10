@@ -29,10 +29,14 @@ declare global {
         onDone: () => void
       }
     ): IPNSSHSession
-    fetch(url: string): Promise<{
+    fetch(request: Request): Promise<{
       status: number
       statusText: string
       text: () => Promise<string>
+      json: () => Promise<unknown>
+      body: ReadableStream
+      headers: Record<string, string>
+      ok: boolean
     }>
   }
 
@@ -100,4 +104,4 @@ declare global {
     | "MachineInvalid"
 }
 
-export {}
+export { }

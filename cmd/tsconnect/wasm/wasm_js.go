@@ -15,6 +15,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/rand/v2"
 	"net"
@@ -199,12 +200,12 @@ func newIPN(jsConfig js.Value) map[string]any {
 		}),
 		"fetch": js.FuncOf(func(this js.Value, args []js.Value) any {
 			if len(args) != 1 {
-				log.Printf("Usage: fetch(url)")
+				log.Printf("Usage: fetch(request)")
 				return nil
 			}
 
-			url := args[0].String()
-			return jsIPN.fetch(url)
+			request := args[0]
+			return jsIPN.fetch(request)
 		}),
 	}
 }
@@ -499,51 +500,119 @@ func (s *jsSSHSession) Resize(rows, cols int) error {
 	return s.session.WindowChange(rows, cols)
 }
 
-func (i *jsIPN) fetch(url string) js.Value {
+func createReadableStreamFromBytes(b []byte) js.Value {
+	uint8Arr := js.Global().Get("Uint8Array").New(len(b))
+	js.CopyBytesToJS(uint8Arr, b)
+
+	constructor := js.Global().Get("ReadableStream")
+	queuingStrategy := js.Global().Get("Object").New()
+
+	source := js.Global().Get("Object").New()
+	source.Set("start", js.FuncOf(func(this js.Value, args []js.Value) any {
+		controller := args[0]
+		controller.Call("enqueue", uint8Arr)
+		controller.Call("close")
+		return nil
+	}))
+
+	return constructor.New(source, queuingStrategy)
+}
+
+func newEmptyReadableStream() js.Value {
+	constructor := js.Global().Get("ReadableStream")
+	source := js.Global().Get("Object").New()
+	source.Set("start", js.FuncOf(func(this js.Value, args []js.Value) any {
+		controller := args[0]
+		controller.Call("close")
+		return nil
+	}))
+	return constructor.New(source)
+}
+
+func (i *jsIPN) fetch(request js.Value) js.Value {
 	return makePromise(func() (any, error) {
 		c := &http.Client{
-			Transport: &http.Transport{
-				DialContext: i.dialer.UserDial,
-			},
+			Transport: &http.Transport{DialContext: i.dialer.UserDial},
 		}
-		res, err := c.Get(url)
+
+		url := request.Get("url").String()
+
+		method := "GET"
+		if m := request.Get("method"); m.Truthy() {
+			method = strings.ToUpper(m.String())
+		}
+
+		var r io.Reader = http.NoBody
+		if b := request.Get("body"); b.Truthy() && b.String() != "" {
+			r = strings.NewReader(b.String())
+		}
+
+		req, err := http.NewRequest(method, url, r)
 		if err != nil {
-			// Return a response-like object for network errors instead of throwing
+			return nil, err
+		}
+
+		// copy headers
+		if headers := request.Get("headers"); headers.Truthy() {
+			keys := js.Global().Get("Object").Call("keys", headers)
+			for j := 0; j < keys.Length(); j++ {
+				k := keys.Index(j).String()
+				v := headers.Get(k).String()
+				req.Header.Set(k, v)
+			}
+		}
+
+		// Do request
+		res, err := c.Do(req)
+		if err != nil {
 			return map[string]any{
-				"status":     0,
-				"statusText": err.Error(),
-				"headers":    make(map[string]any),
-				"ok":         false,
+				"status": 0,
+				"ok":     false,
 				"text": js.FuncOf(func(this js.Value, args []js.Value) any {
 					return makePromise(func() (any, error) {
 						return "", nil
 					})
 				}),
+				"body": newEmptyReadableStream(),
 			}, nil
 		}
+		defer res.Body.Close()
 
-		headers := make(map[string]any)
-		for key, values := range res.Header {
-			if len(values) > 0 {
-				headers[key] = values[0] // Use the first value for each header
+		var buf bytes.Buffer
+		_, readErr := buf.ReadFrom(res.Body)
+		data := buf.Bytes()
+
+		if readErr != nil {
+			return nil, readErr
+		}
+
+		headers := map[string]any{}
+		for k, v := range res.Header {
+			if len(v) > 0 {
+				headers[k] = v[0]
 			}
 		}
 
-		ok := res.StatusCode >= 200 && res.StatusCode < 300
+		stream := createReadableStreamFromBytes(data)
 
 		return map[string]any{
 			"status":     res.StatusCode,
+			"ok":         res.StatusCode >= 200 && res.StatusCode < 300,
 			"statusText": res.Status,
 			"headers":    headers,
-			"ok":         ok,
+			"body":       stream,
 			"text": js.FuncOf(func(this js.Value, args []js.Value) any {
 				return makePromise(func() (any, error) {
-					defer res.Body.Close()
-					buf := new(bytes.Buffer)
-					if _, err := buf.ReadFrom(res.Body); err != nil {
+					return string(data), nil
+				})
+			}),
+			"json": js.FuncOf(func(this js.Value, args []js.Value) any {
+				return makePromise(func() (any, error) {
+					var v any
+					if err := json.Unmarshal(data, &v); err != nil {
 						return nil, err
 					}
-					return buf.String(), nil
+					return v, nil
 				})
 			}),
 		}, nil
