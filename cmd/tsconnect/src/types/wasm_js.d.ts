@@ -17,7 +17,7 @@ declare global {
     body: ReadableStream
     headers: Record<string, string>
     ok: boolean
-    clone: () => Promise<this>
+    clone: () => this
   }
 
   interface IPN {

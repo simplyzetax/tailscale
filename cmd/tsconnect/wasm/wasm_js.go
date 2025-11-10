@@ -589,11 +589,9 @@ func (i *jsIPN) createResponseObject(statusCode int, status, statusText string, 
 			})
 		}),
 		"clone": js.FuncOf(func(this js.Value, args []js.Value) any {
-			return makePromise(func() (any, error) {
-				clone := make([]byte, len(data))
-				copy(clone, data)
-				return i.createResponseObject(statusCode, status, statusText, headers, clone), nil
-			})
+			clone := make([]byte, len(data))
+			copy(clone, data)
+			return i.createResponseObject(statusCode, status, statusText, headers, clone)
 		}),
 	}
 }
