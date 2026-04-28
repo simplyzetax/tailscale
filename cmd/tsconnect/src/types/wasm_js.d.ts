@@ -75,7 +75,34 @@ declare global {
     notifyNetMap: (netMapStr: string) => void
     notifyBrowseToURL: (url: string) => void
     notifyPanicRecover: (err: string) => void
+    notifyPacket?: (packet: IPNPacket) => void
   }
+
+  type IPNPacket = {
+    path: IPNPacketCapturePath
+    time: string
+    bytes: number
+    ipVersion: number
+    proto: string
+    src: string
+    dst: string
+    tcpFlags: number
+    echoRequest: boolean
+    echoResponse: boolean
+    payloadBytes: number
+    didSNAT: boolean
+    originalSrc: string
+    didDNAT: boolean
+    originalDst: string
+  }
+
+  type IPNPacketCapturePath =
+    | "FromLocal"
+    | "FromPeer"
+    | "SynthesizedToLocal"
+    | "SynthesizedToPeer"
+    | "PathDisco"
+    | `CapturePath(${number})`
 
   type IPNNetMap = {
     self: IPNNetMapSelfNode
@@ -92,6 +119,18 @@ declare global {
 
   type IPNNetMapSelfNode = IPNNetMapNode & {
     machineStatus: IPNMachineStatus
+  }
+
+  type TailscaleSelf = {
+    name: string | null
+    magicDNSName: string | null
+    host: string | null
+    addresses: string[]
+    ipv4: string | null
+    ipv6: string | null
+    machineKey: string | null
+    nodeKey: string | null
+    machineStatus: IPNMachineStatus | null
   }
 
   type IPNNetMapPeerNode = IPNNetMapNode & {

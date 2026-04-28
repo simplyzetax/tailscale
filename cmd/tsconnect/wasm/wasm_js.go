@@ -36,6 +36,7 @@ import (
 	"tailscale.com/logpolicy"
 	"tailscale.com/logtail"
 	"tailscale.com/net/netns"
+	tspacket "tailscale.com/net/packet"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/safesocket"
 	"tailscale.com/tailcfg"
@@ -149,6 +150,7 @@ func newIPN(jsConfig js.Value) map[string]any {
 
 	ipnObj := &jsIPN{
 		dialer:     dialer,
+		eng:        eng,
 		srv:        srv,
 		lb:         lb,
 		controlURL: controlURL,
@@ -164,6 +166,7 @@ func newIPN(jsConfig js.Value) map[string]any {
 					notifyNetMap(netMapJSON: string): void,
 					notifyBrowseToURL(url: string): void,
 					notifyPanicRecover(err: string): void,
+					notifyPacket?(packet: object): void,
 				})`)
 				return nil
 			}
@@ -202,12 +205,14 @@ func newIPN(jsConfig js.Value) map[string]any {
 		}),
 		// Bind method value directly; signature matches js.FuncOf required shape.
 		"getPeers": js.FuncOf(ipnObj.GetPeers),
+		"getSelf":  js.FuncOf(ipnObj.GetSelf),
 	}
 }
 
 type jsIPN struct {
 	lastNetmapJSON string
 	dialer         *tsdial.Dialer
+	eng            wgengine.Engine
 	srv            *ipnserver.Server
 	lb             *ipnlocal.LocalBackend
 	controlURL     string
@@ -237,6 +242,7 @@ func (i *jsIPN) run(jsCallbacks js.Value) {
 		jsCallbacks.Call("notifyState", jsIPNState[state])
 	}
 	notifyState(ipn.NoState)
+	i.installPacketCallback(jsCallbacks)
 
 	i.lb.SetNotifyCallback(func(n ipn.Notify) {
 		defer func() {
@@ -319,6 +325,65 @@ func (i *jsIPN) run(jsCallbacks js.Value) {
 	}()
 }
 
+func (i *jsIPN) installPacketCallback(jsCallbacks js.Value) {
+	notifyPacket := jsCallbacks.Get("notifyPacket")
+	if notifyPacket.Type() != js.TypeFunction {
+		i.eng.InstallCaptureHook(nil)
+		return
+	}
+
+	i.eng.InstallCaptureHook(func(path tspacket.CapturePath, at time.Time, data []byte, meta tspacket.CaptureMeta) {
+		if path != tspacket.FromPeer {
+			return
+		}
+
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("notifyPacket panic recovered: %v", r)
+			}
+		}()
+
+		var p tspacket.Parsed
+		p.Decode(data)
+
+		packet := map[string]any{
+			"path":         capturePathString(path),
+			"time":         at.Format(time.RFC3339Nano),
+			"bytes":        len(data),
+			"ipVersion":    int(p.IPVersion),
+			"proto":        p.IPProto.String(),
+			"src":          p.Src.String(),
+			"dst":          p.Dst.String(),
+			"tcpFlags":     int(p.TCPFlags),
+			"echoRequest":  p.IsEchoRequest(),
+			"echoResponse": p.IsEchoResponse(),
+			"payloadBytes": len(p.Payload()),
+			"didSNAT":      meta.DidSNAT,
+			"originalSrc":  meta.OriginalSrc.String(),
+			"didDNAT":      meta.DidDNAT,
+			"originalDst":  meta.OriginalDst.String(),
+		}
+		notifyPacket.Invoke(packet)
+	})
+}
+
+func capturePathString(path tspacket.CapturePath) string {
+	switch path {
+	case tspacket.FromLocal:
+		return "FromLocal"
+	case tspacket.FromPeer:
+		return "FromPeer"
+	case tspacket.SynthesizedToLocal:
+		return "SynthesizedToLocal"
+	case tspacket.SynthesizedToPeer:
+		return "SynthesizedToPeer"
+	case tspacket.PathDisco:
+		return "PathDisco"
+	default:
+		return fmt.Sprintf("CapturePath(%d)", path)
+	}
+}
+
 // GetPeers is exported to JS as ipn.getPeers()
 func (i *jsIPN) GetPeers(this js.Value, args []js.Value) any {
 	if i.lastNetmapJSON == "" {
@@ -327,6 +392,15 @@ func (i *jsIPN) GetPeers(this js.Value, args []js.Value) any {
 	}
 	parsed := jsGlobal.Get("JSON").Call("parse", i.lastNetmapJSON)
 	return parsed.Get("peers")
+}
+
+// GetSelf is exported to JS as ipn.getSelf()
+func (i *jsIPN) GetSelf(this js.Value, args []js.Value) any {
+	if i.lastNetmapJSON == "" {
+		return js.Null()
+	}
+	parsed := jsGlobal.Get("JSON").Call("parse", i.lastNetmapJSON)
+	return parsed.Get("self")
 }
 
 func (i *jsIPN) login() {
