@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package jsontags
@@ -80,9 +80,9 @@ const (
 func (k ReportKind) message() string {
 	switch k {
 	case OmitEmptyUnsupportedInV1:
-		return "uses `omitempty` on an unspported type in json/v1; should probably use `omitzero` instead"
+		return "uses `omitempty` on an unsupported type in json/v1; should probably use `omitzero` instead"
 	case OmitEmptyUnsupportedInV2:
-		return "uses `omitempty` on an unspported type in json/v2; should probably use `omitzero` instead"
+		return "uses `omitempty` on an unsupported type in json/v2; should probably use `omitzero` instead"
 	case OmitEmptyShouldBeOmitZero:
 		return "should use `omitzero` instead of `omitempty`"
 	case OmitEmptyShouldBeOmitZeroButHasIsZero:

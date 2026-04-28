@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package localapi
@@ -25,9 +25,11 @@ import (
 	"testing"
 
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/health"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnauth"
 	"tailscale.com/ipn/ipnlocal"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsd"
@@ -39,6 +41,19 @@ import (
 	"tailscale.com/util/slicesx"
 	"tailscale.com/wgengine"
 )
+
+func handlerForTest(t testing.TB, h *Handler) *Handler {
+	if h.Actor == nil {
+		h.Actor = &ipnauth.TestActor{}
+	}
+	if h.b == nil {
+		h.b = &ipnlocal.LocalBackend{}
+	}
+	if h.logf == nil {
+		h.logf = logger.TestLogger(t)
+	}
+	return h
+}
 
 func TestValidHost(t *testing.T) {
 	tests := []struct {
@@ -57,7 +72,7 @@ func TestValidHost(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.host, func(t *testing.T) {
-			h := &Handler{}
+			h := handlerForTest(t, &Handler{})
 			if got := h.validHost(test.host); got != test.valid {
 				t.Errorf("validHost(%q)=%v, want %v", test.host, got, test.valid)
 			}
@@ -68,10 +83,9 @@ func TestValidHost(t *testing.T) {
 func TestSetPushDeviceToken(t *testing.T) {
 	tstest.Replace(t, &validLocalHostForTesting, true)
 
-	h := &Handler{
+	h := handlerForTest(t, &Handler{
 		PermitWrite: true,
-		b:           &ipnlocal.LocalBackend{},
-	}
+	})
 	s := httptest.NewServer(h)
 	defer s.Close()
 	c := s.Client()
@@ -125,9 +139,9 @@ func (b whoIsBackend) PeerCaps(ip netip.Addr) tailcfg.PeerCapMap {
 //
 // And https://github.com/tailscale/tailscale/issues/12465
 func TestWhoIsArgTypes(t *testing.T) {
-	h := &Handler{
+	h := handlerForTest(t, &Handler{
 		PermitRead: true,
-	}
+	})
 
 	match := func() (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool) {
 		return (&tailcfg.Node{
@@ -190,7 +204,10 @@ func TestWhoIsArgTypes(t *testing.T) {
 
 func TestShouldDenyServeConfigForGOOSAndUserContext(t *testing.T) {
 	newHandler := func(connIsLocalAdmin bool) *Handler {
-		return &Handler{Actor: &ipnauth.TestActor{LocalAdmin: connIsLocalAdmin}, b: newTestLocalBackend(t)}
+		return handlerForTest(t, &Handler{
+			Actor: &ipnauth.TestActor{LocalAdmin: connIsLocalAdmin},
+			b:     newTestLocalBackend(t),
+		})
 	}
 	tests := []struct {
 		name     string
@@ -263,13 +280,17 @@ func TestShouldDenyServeConfigForGOOSAndUserContext(t *testing.T) {
 	})
 }
 
+// TestServeWatchIPNBus used to test that various WatchIPNBus mask flags
+// changed the permissions required to access the endpoint.
+// However, since the removal of the NotifyNoPrivateKeys flag requirement
+// for read-only users, this test now only verifies that the endpoint
+// behaves correctly based on the PermitRead and PermitWrite settings.
 func TestServeWatchIPNBus(t *testing.T) {
 	tstest.Replace(t, &validLocalHostForTesting, true)
 
 	tests := []struct {
 		desc                    string
 		permitRead, permitWrite bool
-		mask                    ipn.NotifyWatchOpt // extra bits in addition to ipn.NotifyInitialState
 		wantStatus              int
 	}{
 		{
@@ -279,20 +300,13 @@ func TestServeWatchIPNBus(t *testing.T) {
 			wantStatus:  http.StatusForbidden,
 		},
 		{
-			desc:        "read-initial-state",
+			desc:        "read-only",
 			permitRead:  true,
 			permitWrite: false,
-			wantStatus:  http.StatusForbidden,
-		},
-		{
-			desc:        "read-initial-state-no-private-keys",
-			permitRead:  true,
-			permitWrite: false,
-			mask:        ipn.NotifyNoPrivateKeys,
 			wantStatus:  http.StatusOK,
 		},
 		{
-			desc:        "read-initial-state-with-private-keys",
+			desc:        "read-and-write",
 			permitRead:  true,
 			permitWrite: true,
 			wantStatus:  http.StatusOK,
@@ -301,17 +315,17 @@ func TestServeWatchIPNBus(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.desc, func(t *testing.T) {
-			h := &Handler{
+			h := handlerForTest(t, &Handler{
 				PermitRead:  tt.permitRead,
 				PermitWrite: tt.permitWrite,
 				b:           newTestLocalBackend(t),
-			}
+			})
 			s := httptest.NewServer(h)
 			defer s.Close()
 			c := s.Client()
 
 			ctx, cancel := context.WithCancel(context.Background())
-			req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/localapi/v0/watch-ipn-bus?mask=%d", s.URL, ipn.NotifyInitialState|tt.mask), nil)
+			req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/localapi/v0/watch-ipn-bus?mask=%d", s.URL, ipn.NotifyInitialState), nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -414,5 +428,141 @@ func TestKeepItSorted(t *testing.T) {
 		if !slices.Equal(gotKeys, want) {
 			t.Errorf("items with trailing slashes should precede those without")
 		}
+	}
+}
+
+func TestServeWithUnhealthyState(t *testing.T) {
+	tstest.Replace(t, &validLocalHostForTesting, true)
+	h := &Handler{
+		PermitRead:  true,
+		PermitWrite: true,
+		b:           newTestLocalBackend(t),
+		logf:        t.Logf,
+	}
+	h.b.HealthTracker().SetUnhealthy(ipn.StateStoreHealth, health.Args{health.ArgError: "testing"})
+	if err := h.b.Start(ipn.Options{}); err != nil {
+		t.Fatal(err)
+	}
+
+	check500Body := func(wantResp string) func(t *testing.T, code int, resp []byte) {
+		return func(t *testing.T, code int, resp []byte) {
+			if code != http.StatusInternalServerError {
+				t.Errorf("got code: %v, want %v\nresponse: %q", code, http.StatusInternalServerError, resp)
+			}
+			if got := strings.TrimSpace(string(resp)); got != wantResp {
+				t.Errorf("got response: %q, want %q", got, wantResp)
+			}
+		}
+	}
+	tests := []struct {
+		desc  string
+		req   *http.Request
+		check func(t *testing.T, code int, resp []byte)
+	}{
+		{
+			desc: "status",
+			req:  httptest.NewRequest("GET", "http://localhost:1234/localapi/v0/status", nil),
+			check: func(t *testing.T, code int, resp []byte) {
+				if code != http.StatusOK {
+					t.Errorf("got code: %v, want %v\nresponse: %q", code, http.StatusOK, resp)
+				}
+				var status ipnstate.Status
+				if err := json.Unmarshal(resp, &status); err != nil {
+					t.Fatal(err)
+				}
+				if status.BackendState != "NoState" {
+					t.Errorf("got backend state: %q, want %q", status.BackendState, "NoState")
+				}
+			},
+		},
+		{
+			desc:  "login-interactive",
+			req:   httptest.NewRequest("POST", "http://localhost:1234/localapi/v0/login-interactive", nil),
+			check: check500Body("cannot log in when state store is unhealthy"),
+		},
+		{
+			desc:  "start",
+			req:   httptest.NewRequest("POST", "http://localhost:1234/localapi/v0/start", strings.NewReader("{}")),
+			check: check500Body("cannot start backend when state store is unhealthy"),
+		},
+		{
+			desc:  "new-profile",
+			req:   httptest.NewRequest("PUT", "http://localhost:1234/localapi/v0/profiles/", nil),
+			check: check500Body("cannot log in when state store is unhealthy"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.desc, func(t *testing.T) {
+			resp := httptest.NewRecorder()
+			h.ServeHTTP(resp, tt.req)
+			tt.check(t, resp.Code, resp.Body.Bytes())
+		})
+	}
+}
+
+func TestServeDialSelf(t *testing.T) {
+	h := handlerForTest(t, &Handler{
+		PermitRead:  true,
+		PermitWrite: true,
+		b:           newTestLocalBackend(t),
+	})
+
+	tests := []struct {
+		name       string
+		host       string
+		port       string
+		wantSelf   bool
+		wantAddr   string
+		wantStatus int
+	}{
+		{
+			name:       "loopback_v4",
+			host:       "127.0.0.1",
+			port:       "8080",
+			wantSelf:   true,
+			wantAddr:   "127.0.0.1:8080",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "loopback_v6",
+			host:       "::1",
+			port:       "8080",
+			wantSelf:   true,
+			wantAddr:   "[::1]:8080",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "localhost",
+			host:       "localhost",
+			port:       "3000",
+			wantSelf:   true,
+			wantStatus: http.StatusOK,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("POST", "http://local-tailscaled.sock/localapi/v0/dial", nil)
+			req.Header.Set("Connection", "upgrade")
+			req.Header.Set("Upgrade", "ts-dial")
+			req.Header.Set("Dial-Host", tt.host)
+			req.Header.Set("Dial-Port", tt.port)
+			resp := httptest.NewRecorder()
+			h.serveDial(resp, req)
+
+			if resp.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d; body: %s", resp.Code, tt.wantStatus, resp.Body.String())
+			}
+			gotSelf := resp.Header().Get("Dial-Self") == "true"
+			if gotSelf != tt.wantSelf {
+				t.Errorf("Dial-Self = %v, want %v", gotSelf, tt.wantSelf)
+			}
+			if tt.wantAddr != "" {
+				if got := resp.Header().Get("Dial-Addr"); got != tt.wantAddr {
+					t.Errorf("Dial-Addr = %q, want %q", got, tt.wantAddr)
+				}
+			}
+		})
 	}
 }

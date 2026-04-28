@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux
@@ -11,7 +11,21 @@
 // As with most container things, configuration is passed through environment
 // variables. All configuration is optional.
 //
-//   - TS_AUTHKEY: the authkey to use for login.
+//   - TS_AUTHKEY: the authkey to use for login. Also accepts TS_AUTH_KEY.
+//     If the value begins with "file:", it is treated as a path to a file containing the key.
+//   - TS_CLIENT_ID: the OAuth client ID. Can be used alone (ID token auto-generated
+//     in well-known environments), with TS_CLIENT_SECRET, or with TS_ID_TOKEN.
+//   - TS_CLIENT_SECRET: the OAuth client secret for generating authkeys.
+//     If the value begins with "file:", it is treated as a path to a file containing the secret.
+//   - TS_ID_TOKEN: the ID token from the identity provider for workload identity federation.
+//     Must be used together with TS_CLIENT_ID. If the value begins with "file:", it is
+//     treated as a path to a file containing the token.
+//   - TS_AUDIENCE: the audience to use when requesting an ID token from a well-known identity provider
+//     to exchange with the control server for workload identity federation. Must be used together
+//     with TS_CLIENT_ID.
+//   - Note: TS_AUTHKEY is mutually exclusive with TS_CLIENT_ID, TS_CLIENT_SECRET, TS_ID_TOKEN,
+//     and TS_AUDIENCE.
+//     TS_CLIENT_SECRET, TS_ID_TOKEN, and TS_AUDIENCE cannot be used together.
 //   - TS_HOSTNAME: the hostname to request for the node.
 //   - TS_ROUTES: subnet routes to advertise. Explicitly setting it to an empty
 //     value will cause containerboot to stop acting as a subnet router for any
@@ -67,8 +81,8 @@
 //   - TS_EXPERIMENTAL_VERSIONED_CONFIG_DIR: if specified, a path to a
 //     directory that containers tailscaled config in file. The config file needs to be
 //     named cap-<current-tailscaled-cap>.hujson. If this is set, TS_HOSTNAME,
-//     TS_EXTRA_ARGS, TS_AUTHKEY,
-//     TS_ROUTES, TS_ACCEPT_DNS env vars must not be set. If this is set,
+//     TS_EXTRA_ARGS, TS_AUTHKEY, TS_CLIENT_ID, TS_CLIENT_SECRET, TS_ID_TOKEN,
+//     TS_ROUTES, TS_ACCEPT_DNS, TS_AUDIENCE env vars must not be set. If this is set,
 //     containerboot only runs `tailscaled --config <path-to-this-configfile>`
 //     and not `tailscale up` or `tailscale set`.
 //     The config file contents are currently read once on container start.
@@ -87,6 +101,10 @@
 //     cluster using the same hostname (in this case, the MagicDNS name of the ingress proxy)
 //     as a non-cluster workload on tailnet.
 //     This is only meant to be configured by the Kubernetes operator.
+//   - TS_EXPERIMENTAL_SERVICE_AUTO_ADVERTISEMENT: If set to true and if this
+//     containerboot instance is not running in Kubernetes, autoadvertise any services
+//     defined in the devices serve config, and unadvertise on shutdown. Defaults
+//     to `true`, but can be disabled to allow user specific advertisement configuration.
 //
 // When running on Kubernetes, containerboot defaults to storing state in the
 // "tailscale" kube secret. To store state on local disk instead, set
@@ -118,17 +136,21 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
-	"tailscale.com/client/tailscale"
+
+	"tailscale.com/health"
 	"tailscale.com/ipn"
 	kubeutils "tailscale.com/k8s-operator"
+	"tailscale.com/kube/authkey"
 	healthz "tailscale.com/kube/health"
 	"tailscale.com/kube/kubetypes"
+	klc "tailscale.com/kube/localclient"
 	"tailscale.com/kube/metrics"
 	"tailscale.com/kube/services"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
-	"tailscale.com/types/ptr"
+	"tailscale.com/types/netmap"
 	"tailscale.com/util/deephash"
+	"tailscale.com/util/dnsname"
 	"tailscale.com/util/linuxfw"
 )
 
@@ -139,6 +161,10 @@ func newNetfilterRunner(logf logger.Logf) (linuxfw.NetfilterRunner, error) {
 	return linuxfw.New(logf, "")
 }
 
+func getAutoAdvertiseBool() bool {
+	return defaultBool("TS_EXPERIMENTAL_SERVICE_AUTO_ADVERTISEMENT", true)
+}
+
 func main() {
 	if err := run(); err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatal(err)
@@ -147,7 +173,6 @@ func main() {
 
 func run() error {
 	log.SetPrefix("boot: ")
-	tailscale.I_Acknowledge_This_API_Is_Unstable = true
 
 	cfg, err := configFromEnv()
 	if err != nil {
@@ -182,8 +207,13 @@ func run() error {
 	bootCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
+	var tailscaledConfigAuthkey string
+	if isOneStepConfig(cfg) {
+		tailscaledConfigAuthkey = authkey.AuthKeyFromConfig(cfg.TailscaledConfigFilePath)
+	}
+
 	var kc *kubeClient
-	if cfg.InKubernetes {
+	if cfg.KubeSecret != "" {
 		kc, err = newKubeClient(cfg.Root, cfg.KubeSecret)
 		if err != nil {
 			return fmt.Errorf("error initializing kube client: %w", err)
@@ -195,7 +225,7 @@ func run() error {
 		// hasKubeStateStore because although we know we're in kube, that
 		// doesn't guarantee the state store is properly configured.
 		if hasKubeStateStore(cfg) {
-			if err := kc.resetContainerbootState(bootCtx, cfg.PodUID); err != nil {
+			if err := kc.resetContainerbootState(bootCtx, cfg.PodUID, tailscaledConfigAuthkey); err != nil {
 				return fmt.Errorf("error clearing previous state from Secret: %w", err)
 			}
 		}
@@ -213,6 +243,7 @@ func run() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 		defer cancel()
 
+		// we are shutting down, we always want to unadvertise here
 		if err := services.EnsureServicesNotAdvertised(ctx, client, log.Printf); err != nil {
 			log.Printf("Error ensuring services are not advertised: %v", err)
 		}
@@ -274,7 +305,7 @@ func run() error {
 		}
 	}
 
-	w, err := client.WatchIPNBus(bootCtx, ipn.NotifyInitialNetMap|ipn.NotifyInitialPrefs|ipn.NotifyInitialState)
+	w, err := client.WatchIPNBus(bootCtx, ipn.NotifyInitialNetMap|ipn.NotifyInitialPrefs|ipn.NotifyInitialState|ipn.NotifyInitialHealthState|ipn.NotifyRateLimit)
 	if err != nil {
 		return fmt.Errorf("failed to watch tailscaled for updates: %w", err)
 	}
@@ -314,7 +345,7 @@ func run() error {
 		if err := tailscaleUp(bootCtx, cfg); err != nil {
 			return fmt.Errorf("failed to auth tailscale: %w", err)
 		}
-		w, err = client.WatchIPNBus(bootCtx, ipn.NotifyInitialNetMap|ipn.NotifyInitialState)
+		w, err = client.WatchIPNBus(bootCtx, ipn.NotifyInitialNetMap|ipn.NotifyInitialState|ipn.NotifyRateLimit)
 		if err != nil {
 			return fmt.Errorf("rewatching tailscaled for updates after auth: %w", err)
 		}
@@ -340,8 +371,23 @@ authLoop:
 				if isOneStepConfig(cfg) {
 					// This could happen if this is the first time tailscaled was run for this
 					// device and the auth key was not passed via the configfile.
-					return fmt.Errorf("invalid state: tailscaled daemon started with a config file, but tailscale is not logged in: ensure you pass a valid auth key in the config file.")
+					if hasKubeStateStore(cfg) {
+						log.Printf("Auth key missing or invalid (NeedsLogin state), disconnecting from control and requesting new key from operator")
+
+						err := kc.setAndWaitForAuthKeyReissue(ctx, client, cfg, tailscaledConfigAuthkey)
+						if err != nil {
+							return fmt.Errorf("failed to get a reissued authkey: %w", err)
+						}
+
+						log.Printf("Successfully received new auth key, restarting to apply configuration")
+
+						// we don't return an error here since we have handled the reissue gracefully.
+						return nil
+					}
+
+					return errors.New("invalid state: tailscaled daemon started with a config file, but tailscale is not logged in: ensure you pass a valid auth key in the config file")
 				}
+
 				if err := authTailscale(); err != nil {
 					return fmt.Errorf("failed to auth tailscale: %w", err)
 				}
@@ -357,6 +403,27 @@ authLoop:
 				break authLoop
 			default:
 				log.Printf("tailscaled in state %q, waiting", *n.State)
+			}
+		}
+
+		if n.Health != nil {
+			// This can happen if the config has an auth key but it's invalid,
+			// for example if it was single-use and already got used, but the
+			// device state was lost.
+			if _, ok := n.Health.Warnings[health.LoginStateWarnable.Code]; ok {
+				if isOneStepConfig(cfg) && hasKubeStateStore(cfg) {
+					log.Printf("Auth key failed to authenticate (may be expired or single-use), disconnecting from control and requesting new key from operator")
+
+					err := kc.setAndWaitForAuthKeyReissue(ctx, client, cfg, tailscaledConfigAuthkey)
+					if err != nil {
+						return fmt.Errorf("failed to get a reissued authkey: %w", err)
+					}
+
+					// we don't return an error here since we have handled the reissue gracefully.
+					log.Printf("Successfully received new auth key, restarting to apply configuration")
+
+					return nil
+				}
 			}
 		}
 	}
@@ -384,21 +451,23 @@ authLoop:
 		// We were told to only auth once, so any secret-bound
 		// authkey is no longer needed. We don't strictly need to
 		// wipe it, but it's good hygiene.
-		log.Printf("Deleting authkey from kube secret")
+		log.Printf("Deleting authkey from Kubernetes Secret")
 		if err := kc.deleteAuthKey(ctx); err != nil {
-			return fmt.Errorf("deleting authkey from kube secret: %w", err)
+			return fmt.Errorf("deleting authkey from Kubernetes Secret: %w", err)
 		}
 	}
 
-	w, err = client.WatchIPNBus(ctx, ipn.NotifyInitialNetMap|ipn.NotifyInitialState)
+	w, err = client.WatchIPNBus(ctx, ipn.NotifyInitialNetMap|ipn.NotifyInitialState|ipn.NotifyRateLimit)
 	if err != nil {
 		return fmt.Errorf("rewatching tailscaled for updates after auth: %w", err)
 	}
 
 	// If tailscaled config was read from a mounted file, watch the file for updates and reload.
 	cfgWatchErrChan := make(chan error)
+	cfgWatchCtx, cfgWatchCancel := context.WithCancel(ctx)
+	defer cfgWatchCancel()
 	if cfg.TailscaledConfigFilePath != "" {
-		go watchTailscaledConfigChanges(ctx, cfg.TailscaledConfigFilePath, client, cfgWatchErrChan)
+		go watchTailscaledConfigChanges(cfgWatchCtx, cfg.TailscaledConfigFilePath, client, cfgWatchErrChan)
 	}
 
 	var (
@@ -498,6 +567,7 @@ runLoop:
 		case err := <-cfgWatchErrChan:
 			return fmt.Errorf("failed to watch tailscaled config: %w", err)
 		case n := <-notifyChan:
+			// TODO: (ChaosInTheCRD) Add node removed check when supported by ipn
 			if n.State != nil && *n.State != ipn.Running {
 				// Something's gone wrong and we've left the authenticated state.
 				// Our container image never recovered gracefully from this, and the
@@ -526,27 +596,14 @@ runLoop:
 					}
 				}
 				if cfg.TailnetTargetFQDN != "" {
-					var (
-						egressAddrs          []netip.Prefix
-						newCurentEgressIPs   deephash.Sum
-						egressIPsHaveChanged bool
-						node                 tailcfg.NodeView
-						nodeFound            bool
-					)
-					for _, n := range n.NetMap.Peers {
-						if strings.EqualFold(n.Name(), cfg.TailnetTargetFQDN) {
-							node = n
-							nodeFound = true
-							break
-						}
-					}
-					if !nodeFound {
-						log.Printf("Tailscale node %q not found; it either does not exist, or not reachable because of ACLs", cfg.TailnetTargetFQDN)
+					egressAddrs, err := resolveTailnetFQDN(n.NetMap, cfg.TailnetTargetFQDN)
+					if err != nil {
+						log.Print(err.Error())
 						break
 					}
-					egressAddrs = node.Addresses().AsSlice()
-					newCurentEgressIPs = deephash.Hash(&egressAddrs)
-					egressIPsHaveChanged = newCurentEgressIPs != currentEgressIPs
+
+					newCurentEgressIPs := deephash.Hash(&egressAddrs)
+					egressIPsHaveChanged := newCurentEgressIPs != currentEgressIPs
 					// The firewall rules get (re-)installed:
 					// - on startup
 					// - when the tailnet IPs of the tailnet target have changed
@@ -599,7 +656,7 @@ runLoop:
 					if cd == "" {
 						cd = kubetypes.ValueNoHTTPS
 					}
-					prev := certDomain.Swap(ptr.To(cd))
+					prev := certDomain.Swap(new(cd))
 					if prev == nil || *prev != cd {
 						select {
 						case certDomainChanged <- true:
@@ -649,9 +706,22 @@ runLoop:
 					healthCheck.Update(len(addrs) != 0)
 				}
 
+				var prevServeConfig *ipn.ServeConfig
+				if getAutoAdvertiseBool() {
+					prevServeConfig, err = client.GetServeConfig(ctx)
+					if err != nil {
+						return fmt.Errorf("autoadvertisement: failed to get serve config: %w", err)
+					}
+
+					err = refreshAdvertiseServices(ctx, prevServeConfig, klc.New(client))
+					if err != nil {
+						return fmt.Errorf("autoadvertisement: failed to refresh advertise services: %w", err)
+					}
+				}
+
 				if cfg.ServeConfigPath != "" {
 					triggerWatchServeConfigChanges.Do(func() {
-						go watchServeConfigChanges(ctx, certDomainChanged, certDomain, client, kc, cfg)
+						go watchServeConfigChanges(ctx, certDomainChanged, certDomain, client, kc, cfg, prevServeConfig)
 					})
 				}
 
@@ -891,4 +961,66 @@ func runHTTPServer(mux *http.ServeMux, addr string) (close func() error) {
 		err := srv.Shutdown(context.Background())
 		return errors.Join(err, ln.Close())
 	}
+}
+
+// resolveTailnetFQDN resolves a tailnet FQDN to a list of IP prefixes, which
+// can be either a peer device or a Tailscale Service.
+func resolveTailnetFQDN(nm *netmap.NetworkMap, fqdn string) ([]netip.Prefix, error) {
+	dnsFQDN, err := dnsname.ToFQDN(fqdn)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing %q as FQDN: %w", fqdn, err)
+	}
+
+	// Check all peer devices first.
+	for _, p := range nm.Peers {
+		if strings.EqualFold(p.Name(), dnsFQDN.WithTrailingDot()) {
+			return p.Addresses().AsSlice(), nil
+		}
+	}
+
+	// If not found yet, check for a matching Tailscale Service.
+	if svcIPs := serviceIPsFromNetMap(nm, dnsFQDN); len(svcIPs) != 0 {
+		return svcIPs, nil
+	}
+
+	return nil, fmt.Errorf("could not find Tailscale node or service %q; it either does not exist, or not reachable because of ACLs", fqdn)
+}
+
+// serviceIPsFromNetMap returns all IPs of a Tailscale Service if its FQDN is
+// found in the netmap. Note that Tailscale Services are not a first-class
+// object in the netmap, so we guess based on DNS ExtraRecords and AllowedIPs.
+func serviceIPsFromNetMap(nm *netmap.NetworkMap, fqdn dnsname.FQDN) []netip.Prefix {
+	var extraRecords []tailcfg.DNSRecord
+	for _, rec := range nm.DNS.ExtraRecords {
+		recFQDN, err := dnsname.ToFQDN(rec.Name)
+		if err != nil {
+			continue
+		}
+		if strings.EqualFold(fqdn.WithTrailingDot(), recFQDN.WithTrailingDot()) {
+			extraRecords = append(extraRecords, rec)
+		}
+	}
+
+	if len(extraRecords) == 0 {
+		return nil
+	}
+
+	// Validate we can see a peer advertising the Tailscale Service.
+	var prefixes []netip.Prefix
+	for _, extraRecord := range extraRecords {
+		ip, err := netip.ParseAddr(extraRecord.Value)
+		if err != nil {
+			continue
+		}
+		ipPrefix := netip.PrefixFrom(ip, ip.BitLen())
+		for _, ps := range nm.Peers {
+			for _, allowedIP := range ps.AllowedIPs().All() {
+				if allowedIP == ipPrefix {
+					prefixes = append(prefixes, ipPrefix)
+				}
+			}
+		}
+	}
+
+	return prefixes
 }

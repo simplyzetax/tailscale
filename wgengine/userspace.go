@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package wgengine
@@ -7,13 +7,13 @@ import (
 	"bufio"
 	"context"
 	crand "crypto/rand"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
 	"maps"
 	"math"
 	"net/netip"
-	"reflect"
 	"runtime"
 	"slices"
 	"strings"
@@ -42,16 +42,20 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime/mono"
 	"tailscale.com/types/dnstype"
+	"tailscale.com/types/events"
 	"tailscale.com/types/ipproto"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/views"
+	"tailscale.com/util/backoff"
 	"tailscale.com/util/checkchange"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/eventbus"
+	"tailscale.com/util/execqueue"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/set"
+	"tailscale.com/util/singleflight"
 	"tailscale.com/util/testenv"
 	"tailscale.com/util/usermetric"
 	"tailscale.com/version"
@@ -97,6 +101,8 @@ type userspaceEngine struct {
 	eventBus    *eventbus.Bus
 	eventClient *eventbus.Client
 
+	linkChangeQueue execqueue.ExecQueue
+
 	logf           logger.Logf
 	wgLogger       *wglog.Logger // a wireguard-go logging wrapper
 	reqCh          chan struct{}
@@ -115,7 +121,8 @@ type userspaceEngine struct {
 	birdClient     BIRDClient          // or nil
 	controlKnobs   *controlknobs.Knobs // or nil
 
-	testMaybeReconfigHook func() // for tests; if non-nil, fires if maybeReconfigWireguardLocked called
+	testMaybeReconfigHook func()                        // for tests; if non-nil, fires if maybeReconfigWireguardLocked called
+	testDiscoChangedHook  func(map[key.NodePublic]bool) // for tests; if non-nil, fires after assembling discoChanged map
 
 	// isLocalAddr reports the whether an IP is assigned to the local
 	// tunnel interface. It's used to reflect local packets
@@ -138,14 +145,15 @@ type userspaceEngine struct {
 	trimmedNodes        map[key.NodePublic]bool   // set of node keys of peers currently excluded from wireguard config
 	sentActivityAt      map[netip.Addr]*mono.Time // value is accessed atomically
 	destIPActivityFuncs map[netip.Addr]func()
-	lastStatusPollTime  mono.Time    // last time we polled the engine status
-	reconfigureVPN      func() error // or nil
+	lastStatusPollTime  mono.Time         // last time we polled the engine status
+	reconfigureVPN      func() error      // or nil
+	conn25PacketHooks   Conn25PacketHooks // or nil
 
 	mu             sync.Mutex         // guards following; see lock order comment below
 	netMap         *netmap.NetworkMap // or nil
 	closing        bool               // Close was called (even if we're still closing)
 	statusCallback StatusCallback
-	peerSequence   []key.NodePublic
+	peerSequence   views.Slice[key.NodePublic]
 	endpoints      []tailcfg.Endpoint
 	pendOpen       map[flowtrackTuple]*pendingOpenFlow // see pendopen.go
 
@@ -160,6 +168,10 @@ type userspaceEngine struct {
 	// networkLogger logs statistics about network connections.
 	networkLogger netlog.Logger
 
+	// tsmpLearnedDisco tracks per node key if a peer disco key was learned via TSMP.
+	// wgLock must be held when using this map.
+	tsmpLearnedDisco map[key.NodePublic]key.DiscoPublic
+
 	// Lock ordering: magicsock.Conn.mu, wgLock, then mu.
 }
 
@@ -168,6 +180,19 @@ type BIRDClient interface {
 	EnableProtocol(proto string) error
 	DisableProtocol(proto string) error
 	Close() error
+}
+
+// Conn25PacketHooks are hooks for Connectors 2025 app connectors.
+// They are meant to be wired into to corresponding hooks in the
+// [tstun.Wrapper]. They may modify the packet (e.g., NAT), or drop
+// invalid app connector traffic.
+type Conn25PacketHooks interface {
+	// HandlePacketsFromTunDevice sends packets originating from the tun device
+	// for further Connectors 2025 app connectors processing.
+	HandlePacketsFromTunDevice(*packet.Parsed) filter.Response
+	// HandlePacketsFromWireguard sends packets originating from WireGuard
+	// for further Connectors 2025 app connectors processing.
+	HandlePacketsFromWireGuard(*packet.Parsed) filter.Response
 }
 
 // Config is the engine configuration.
@@ -211,6 +236,10 @@ type Config struct {
 	// If nil, a new Dialer is created.
 	Dialer *tsdial.Dialer
 
+	// ExtraRootCAs, if non-nil, specifies additional trusted root CAs for TLS
+	// connections (e.g. DERP). Passed through to magicsock.
+	ExtraRootCAs *x509.CertPool
+
 	// ControlKnobs is the set of control plane-provied knobs
 	// to use.
 	// If nil, defaults are used.
@@ -242,6 +271,24 @@ type Config struct {
 	// TODO(creachadair): As of 2025-03-19 this is optional, but is intended to
 	// become required non-nil.
 	EventBus *eventbus.Bus
+
+	// Conn25PacketHooks, if non-nil, is used to hook packets for Connectors 2025
+	// app connector handling logic.
+	Conn25PacketHooks Conn25PacketHooks
+
+	// ForceDiscoKey, if non-zero, forces the use of a specific disco
+	// private key. This should only be used for special cases and
+	// experiments, not for production. The recommended normal path is to
+	// leave it zero, in which case a new disco key is generated per
+	// Tailscale start and kept only in memory.
+	ForceDiscoKey key.DiscoPrivate
+
+	// OnDERPRecv, if non-nil, is called for every non-disco packet
+	// received from DERP before the peer map lookup. If it returns
+	// true, the packet is considered handled and is not passed to
+	// WireGuard. The pkt slice is borrowed and must be copied if
+	// the callee needs to retain it.
+	OnDERPRecv func(regionID int, src key.NodePublic, pkt []byte) (handled bool)
 }
 
 // NewFakeUserspaceEngine returns a new userspace engine for testing.
@@ -319,9 +366,9 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 
 	var tsTUNDev *tstun.Wrapper
 	if conf.IsTAP {
-		tsTUNDev = tstun.WrapTAP(logf, conf.Tun, conf.Metrics)
+		tsTUNDev = tstun.WrapTAP(logf, conf.Tun, conf.Metrics, conf.EventBus)
 	} else {
-		tsTUNDev = tstun.Wrap(logf, conf.Tun, conf.Metrics)
+		tsTUNDev = tstun.Wrap(logf, conf.Tun, conf.Metrics, conf.EventBus)
 	}
 	closePool.add(tsTUNDev)
 
@@ -343,19 +390,20 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 	}
 
 	e := &userspaceEngine{
-		eventBus:       conf.EventBus,
-		timeNow:        mono.Now,
-		logf:           logf,
-		reqCh:          make(chan struct{}, 1),
-		waitCh:         make(chan struct{}),
-		tundev:         tsTUNDev,
-		router:         rtr,
-		dialer:         conf.Dialer,
-		confListenPort: conf.ListenPort,
-		birdClient:     conf.BIRDClient,
-		controlKnobs:   conf.ControlKnobs,
-		reconfigureVPN: conf.ReconfigureVPN,
-		health:         conf.HealthTracker,
+		eventBus:          conf.EventBus,
+		timeNow:           mono.Now,
+		logf:              logf,
+		reqCh:             make(chan struct{}, 1),
+		waitCh:            make(chan struct{}),
+		tundev:            tsTUNDev,
+		router:            rtr,
+		dialer:            conf.Dialer,
+		confListenPort:    conf.ListenPort,
+		birdClient:        conf.BIRDClient,
+		controlKnobs:      conf.ControlKnobs,
+		reconfigureVPN:    conf.ReconfigureVPN,
+		health:            conf.HealthTracker,
+		conn25PacketHooks: conf.Conn25PacketHooks,
 	}
 
 	if e.birdClient != nil {
@@ -383,7 +431,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 	conf.Dialer.SetTUNName(tunName)
 	conf.Dialer.SetNetMon(e.netMon)
 	conf.Dialer.SetBus(e.eventBus)
-	e.dns = dns.NewManager(logf, conf.DNS, e.health, conf.Dialer, fwdDNSLinkSelector{e, tunName}, conf.ControlKnobs, runtime.GOOS)
+	e.dns = dns.NewManager(logf, conf.DNS, e.health, conf.Dialer, fwdDNSLinkSelector{e, tunName}, conf.ControlKnobs, runtime.GOOS, e.eventBus)
 
 	// TODO: there's probably a better place for this
 	sockstats.SetNetMon(e.netMon)
@@ -406,9 +454,12 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		IdleFunc:       e.tundev.IdleDuration,
 		NetMon:         e.netMon,
 		HealthTracker:  e.health,
+		ExtraRootCAs:   conf.ExtraRootCAs,
 		Metrics:        conf.Metrics,
 		ControlKnobs:   conf.ControlKnobs,
 		PeerByKeyFunc:  e.PeerByKey,
+		ForceDiscoKey:  conf.ForceDiscoKey,
+		OnDERPRecv:     conf.OnDERPRecv,
 	}
 	if buildfeatures.HasLazyWG {
 		magicsockOpts.NoteRecvActivity = e.noteRecvActivity
@@ -429,6 +480,16 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 	}
 	e.tundev.PreFilterPacketOutboundToWireGuardEngineIntercept = e.handleLocalPackets
 
+	if e.conn25PacketHooks != nil {
+		e.tundev.PreFilterPacketOutboundToWireGuardAppConnectorIntercept = func(p *packet.Parsed, _ *tstun.Wrapper) filter.Response {
+			return e.conn25PacketHooks.HandlePacketsFromTunDevice(p)
+		}
+
+		e.tundev.PostFilterPacketInboundFromWireGuardAppConnector = func(p *packet.Parsed, _ *tstun.Wrapper) filter.Response {
+			return e.conn25PacketHooks.HandlePacketsFromWireGuard(p)
+		}
+	}
+
 	if buildfeatures.HasDebug && envknob.BoolDefaultTrue("TS_DEBUG_CONNECT_FAILURES") {
 		if e.tundev.PreFilterPacketInboundFromWireGuard != nil {
 			return nil, errors.New("unexpected PreFilterIn already set")
@@ -447,6 +508,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		cb := e.pongCallback[pong.Data]
 		e.logf("wgengine: got TSMP pong %02x, peerAPIPort=%v; cb=%v", pong.Data, pong.PeerAPIPort, cb != nil)
 		if cb != nil {
+			delete(e.pongCallback, pong.Data)
 			go cb(pong)
 		}
 	}
@@ -460,6 +522,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 			// We didn't swallow it, so let it flow to the host.
 			return false
 		}
+		delete(e.icmpEchoResponseCallback, idSeq)
 		e.logf("wgengine: got diagnostic ICMP response %02x", idSeq)
 		go cb()
 		return true
@@ -543,7 +606,32 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		if f, ok := feature.HookProxyInvalidateCache.GetOk(); ok {
 			f()
 		}
-		e.linkChange(&cd)
+		e.linkChangeQueue.Add(func() { e.linkChange(&cd) })
+	})
+	eventbus.SubscribeFunc(ec, func(update events.PeerDiscoKeyUpdate) {
+		e.logf("wgengine: got TSMP disco key advertisement from %v via eventbus", update.Src)
+		if e.magicConn == nil {
+			e.logf("wgengine: no magicConn")
+			return
+		}
+
+		pkt := packet.TSMPDiscoKeyAdvertisement{
+			Key: update.Key,
+		}
+		peer, ok := e.PeerForIP(update.Src)
+		if !ok {
+			e.logf("wgengine: no peer found for %v", update.Src)
+			return
+		}
+		e.magicConn.HandleDiscoKeyAdvertisement(peer.Node, pkt)
+	})
+	var tsmpRequestGroup singleflight.Group[netip.Addr, struct{}]
+	eventbus.SubscribeFunc(ec, func(req magicsock.NewDiscoKeyAvailable) {
+		go tsmpRequestGroup.Do(req.NodeFirstAddr, func() (struct{}, error) {
+			e.sendTSMPDiscoAdvertisement(req.NodeFirstAddr)
+			e.logf("wgengine: sending TSMP disco key advertisement to %v", req.NodeFirstAddr)
+			return struct{}{}, nil
+		})
 	})
 	e.eventClient = ec
 	e.logf("Engine created.")
@@ -704,15 +792,43 @@ func (e *userspaceEngine) isActiveSinceLocked(nk key.NodePublic, ip netip.Addr, 
 
 // maybeReconfigInputs holds the inputs to the maybeReconfigWireguardLocked
 // function. If these things don't change between calls, there's nothing to do.
+//
+// If you add a field, update Equal and Clone, and add a case to
+// TestMaybeReconfigInputsEqual.
 type maybeReconfigInputs struct {
 	WGConfig     *wgcfg.Config
 	TrimmedNodes map[key.NodePublic]bool
-	TrackNodes   views.Slice[key.NodePublic]
-	TrackIPs     views.Slice[netip.Addr]
+
+	// TrackNodes and TrackIPs are built in full.Peers iteration order,
+	// which is sorted by NodeID (via sortedPeers -> WGCfg). Equal uses
+	// order-dependent comparison, so any change to that ordering
+	// invariant must update the comparison logic.
+	TrackNodes views.Slice[key.NodePublic]
+	TrackIPs   views.Slice[netip.Addr]
 }
 
 func (i *maybeReconfigInputs) Equal(o *maybeReconfigInputs) bool {
-	return reflect.DeepEqual(i, o)
+	if i == o {
+		return true
+	}
+	if i == nil || o == nil {
+		return false
+	}
+	if !i.WGConfig.Equal(o.WGConfig) {
+		return false
+	}
+	if len(i.TrimmedNodes) != len(o.TrimmedNodes) {
+		return false
+	}
+	for k := range i.TrimmedNodes {
+		if !o.TrimmedNodes[k] {
+			return false
+		}
+	}
+	if !views.SliceEqual(i.TrackNodes, o.TrackNodes) {
+		return false
+	}
+	return views.SliceEqual(i.TrackIPs, o.TrackIPs)
 }
 
 func (i *maybeReconfigInputs) Clone() *maybeReconfigInputs {
@@ -760,6 +876,10 @@ func (e *userspaceEngine) maybeReconfigWireguardLocked(discoChanged map[key.Node
 	// their NodeKey and Tailscale IPs. These are the ones we'll need
 	// to install tracking hooks for to watch their send/receive
 	// activity.
+	//
+	// trackNodes and trackIPs are appended in full.Peers order (sorted
+	// by NodeID). maybeReconfigInputs.Equal depends on this ordering;
+	// see the struct comment.
 	var trackNodes []key.NodePublic
 	var trackIPs []netip.Addr
 	if buildfeatures.HasLazyWG {
@@ -924,6 +1044,38 @@ func hasOverlap(aips, rips views.Slice[netip.Prefix]) bool {
 	return false
 }
 
+// ResetAndStop resets the engine to a clean state (like calling Reconfig
+// with all pointers to zero values) and waits for it to be fully stopped,
+// with no live peers or DERPs.
+//
+// Unlike Reconfig, it does not return ErrNoChanges.
+//
+// If the engine stops, returns the status. NB that this status will not be sent
+// to the registered status callback, it is on the caller to ensure this status
+// is handled appropriately.
+func (e *userspaceEngine) ResetAndStop() (*Status, error) {
+	if err := e.Reconfig(&wgcfg.Config{}, &router.Config{}, &dns.Config{}); err != nil && !errors.Is(err, ErrNoChanges) {
+		return nil, err
+	}
+	bo := backoff.NewBackoff("UserspaceEngineResetAndStop", e.logf, 1*time.Second)
+	for {
+		st, err := e.getStatus()
+		if err != nil {
+			return nil, err
+		}
+		if len(st.Peers) == 0 && st.DERPs == 0 {
+			return st, nil
+		}
+		bo.BackOff(context.Background(), fmt.Errorf("waiting for engine to stop: peers=%d derps=%d", len(st.Peers), st.DERPs))
+	}
+}
+
+func (e *userspaceEngine) PatchDiscoKey(pub key.NodePublic, disco key.DiscoPublic) {
+	e.wgLock.Lock()
+	defer e.wgLock.Unlock()
+	mak.Set(&e.tsmpLearnedDisco, pub, disco)
+}
+
 func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, dnsCfg *dns.Config) error {
 	if routerCfg == nil {
 		panic("routerCfg must not be nil")
@@ -939,12 +1091,15 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 	e.tundev.SetWGConfig(cfg)
 
 	peerSet := make(set.Set[key.NodePublic], len(cfg.Peers))
+
 	e.mu.Lock()
-	e.peerSequence = e.peerSequence[:0]
+	seq := make([]key.NodePublic, 0, len(cfg.Peers))
 	for _, p := range cfg.Peers {
-		e.peerSequence = append(e.peerSequence, p.PublicKey)
+		seq = append(seq, p.PublicKey)
 		peerSet.Add(p.PublicKey)
 	}
+	e.peerSequence = views.SliceOf(seq)
+
 	nm := e.netMap
 	e.mu.Unlock()
 
@@ -1012,12 +1167,51 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 			if p.DiscoKey.IsZero() {
 				continue
 			}
+
+			// If the key changed, mark the connection for reconfiguration.
 			pub := p.PublicKey
+
 			if old, ok := prevEP[pub]; ok && old != p.DiscoKey {
+				// If the disco key was learned via TSMP, we do not need to reset the
+				// wireguard config as the new key was received over an existing wireguard
+				// connection.
+				if discoTSMP, okTSMP := e.tsmpLearnedDisco[p.PublicKey]; okTSMP {
+					if discoTSMP == p.DiscoKey {
+						// Key matches, remove entry from map.
+						e.logf("wgengine: Skipping reconfig (TSMP key): %s changed from %q to %q",
+							pub.ShortString(), old, p.DiscoKey)
+						delete(e.tsmpLearnedDisco, p.PublicKey)
+					} else {
+						// The new disco key does not match what we received via
+						// TSMP for this peer. This is unexpected, so log it.
+						// If it does happen, overwrite the previously-saved
+						// disco key with the new one for now:  We expect another
+						// update must be pending in that case, so keep the map
+						// entry.
+						// The reason why this should never happen is that only a single
+						// request is coming through the netmap pipeline at a time, and there
+						// should realistically ever only be a single entry in the map. This
+						// is really a belt and suspenders solution to find usage that is
+						// inconsistent with our expectations.
+						e.logf("wgengine: [unexpected] Reconfig: using TSMP key for %s (control stale): tsmp=%q control=%q old=%q",
+							pub.ShortString(), discoTSMP, p.DiscoKey, old)
+						metricTSMPLearnedKeyMismatch.Add(1)
+						p.DiscoKey = discoTSMP
+					}
+
+					// Skip session clear no matter what.
+					continue
+				}
+
 				discoChanged[pub] = true
 				e.logf("wgengine: Reconfig: %s changed from %q to %q", pub.ShortString(), old, p.DiscoKey)
 			}
 		}
+	}
+
+	// For tests, what disco connections needs to be changed.
+	if e.testDiscoChangedHook != nil {
+		e.testDiscoChangedHook(discoChanged)
 	}
 
 	e.lastCfgFull = *cfg.Clone()
@@ -1035,6 +1229,13 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 
 	if err := e.maybeReconfigWireguardLocked(discoChanged); err != nil {
 		return err
+	}
+
+	// Cleanup map of tsmp marks for peers that no longer exists in config.
+	for nodeKey := range e.tsmpLearnedDisco {
+		if !peerSet.Contains(nodeKey) {
+			delete(e.tsmpLearnedDisco, nodeKey)
+		}
 	}
 
 	// Shutdown the network logger because the IDs changed.
@@ -1199,7 +1400,7 @@ func (e *userspaceEngine) getStatus() (*Status, error) {
 
 	e.mu.Lock()
 	closing := e.closing
-	peerKeys := slices.Clone(e.peerSequence)
+	peerKeys := e.peerSequence
 	localAddrs := slices.Clone(e.endpoints)
 	e.mu.Unlock()
 
@@ -1207,8 +1408,8 @@ func (e *userspaceEngine) getStatus() (*Status, error) {
 		return nil, ErrEngineClosing
 	}
 
-	peers := make([]ipnstate.PeerStatusLite, 0, len(peerKeys))
-	for _, key := range peerKeys {
+	peers := make([]ipnstate.PeerStatusLite, 0, peerKeys.Len())
+	for _, key := range peerKeys.All() {
 		if status, ok := e.getPeerStatusLite(key); ok {
 			peers = append(peers, status)
 		}
@@ -1258,6 +1459,9 @@ func (e *userspaceEngine) RequestStatus() {
 
 func (e *userspaceEngine) Close() {
 	e.eventClient.Close()
+	// TODO(cmol): Should we wait for it too?
+	// Same question raised in appconnector.go.
+	e.linkChangeQueue.Shutdown()
 	e.mu.Lock()
 	if e.closing {
 		e.mu.Unlock()
@@ -1294,20 +1498,18 @@ func (e *userspaceEngine) Done() <-chan struct{} {
 }
 
 func (e *userspaceEngine) linkChange(delta *netmon.ChangeDelta) {
-	changed := delta.Major // TODO(bradfitz): ask more specific questions?
-	cur := delta.New
-	up := cur.AnyInterfaceUp()
+
+	up := delta.AnyInterfaceUp()
 	if !up {
-		e.logf("LinkChange: all links down; pausing: %v", cur)
-	} else if changed {
-		e.logf("LinkChange: major, rebinding. New state: %v", cur)
+		e.logf("LinkChange: all links down; pausing: %v", delta.StateDesc())
+	} else if delta.RebindLikelyRequired {
+		e.logf("LinkChange: major, rebinding: %v", delta.StateDesc())
 	} else {
 		e.logf("[v1] LinkChange: minor")
 	}
 
 	e.health.SetAnyInterfaceUp(up)
-	e.magicConn.SetNetworkUp(up)
-	if !up || changed {
+	if !up || delta.RebindLikelyRequired {
 		if err := e.dns.FlushCaches(); err != nil {
 			e.logf("wgengine: dns flush failed after major link change: %v", err)
 		}
@@ -1317,9 +1519,20 @@ func (e *userspaceEngine) linkChange(delta *netmon.ChangeDelta) {
 	// suspend/resume or whenever NetworkManager is started, it
 	// nukes all systemd-resolved configs. So reapply our DNS
 	// config on major link change.
-	// TODO: explain why this is ncessary not just on Linux but also android
-	// and Apple platforms.
-	if changed {
+	//
+	// On Darwin (netext), we reapply the DNS config when the interface flaps
+	// because the change in interface can potentially change the nameservers
+	// for the forwarder.  On Darwin netext clients, magicDNS is ~always the default
+	// resolver so having no nameserver to forward queries to (or one on a network we
+	// are not currently on) breaks DNS resolution system-wide.  There are notable
+	// timing issues here with Darwin's network stack.  It is not guaranteed that
+	// the forward resolver will be available immediately after the interface
+	// comes up.  We leave it to the network extension to also poke magicDNS directly
+	// via [dns.Manager.RecompileDNSConfig] when it detects any change in the
+	// nameservers.
+	//
+	// TODO: On Android, Darwin-tailscaled, and openbsd, why do we need this?
+	if delta.RebindLikelyRequired && up {
 		switch runtime.GOOS {
 		case "linux", "android", "ios", "darwin", "openbsd":
 			e.wgLock.Lock()
@@ -1337,15 +1550,23 @@ func (e *userspaceEngine) linkChange(delta *netmon.ChangeDelta) {
 		}
 	}
 
+	e.magicConn.SetNetworkUp(up)
+
 	why := "link-change-minor"
-	if changed {
+	if delta.RebindLikelyRequired {
 		why = "link-change-major"
 		metricNumMajorChanges.Add(1)
-		e.magicConn.Rebind()
 	} else {
 		metricNumMinorChanges.Add(1)
 	}
-	e.magicConn.ReSTUN(why)
+
+	// If we're up and it's a minor change, just send a STUN ping
+	if up {
+		if delta.RebindLikelyRequired {
+			e.magicConn.Rebind()
+		}
+		e.magicConn.ReSTUN(why)
+	}
 }
 
 func (e *userspaceEngine) SetNetworkMap(nm *netmap.NetworkMap) {
@@ -1400,6 +1621,7 @@ func (e *userspaceEngine) Ping(ip netip.Addr, pingType tailcfg.PingType, size in
 		e.magicConn.Ping(peer, res, size, cb)
 	case "TSMP":
 		e.sendTSMPPing(ip, peer, res, cb)
+		e.sendTSMPDiscoAdvertisement(ip)
 	case "ICMP":
 		e.sendICMPEchoRequest(ip, peer, res, cb)
 	}
@@ -1518,6 +1740,29 @@ func (e *userspaceEngine) sendTSMPPing(ip netip.Addr, peer tailcfg.NodeView, res
 
 	tsmpPing := packet.Generate(iph, tsmpPayload[:])
 	e.tundev.InjectOutbound(tsmpPing)
+}
+
+func (e *userspaceEngine) sendTSMPDiscoAdvertisement(ip netip.Addr) {
+	srcIP, err := e.mySelfIPMatchingFamily(ip)
+	if err != nil {
+		e.logf("getting matching node: %s", err)
+		return
+	}
+	tdka := packet.TSMPDiscoKeyAdvertisement{
+		Src: srcIP,
+		Dst: ip,
+		Key: e.magicConn.DiscoPublicKey(),
+	}
+	payload, err := tdka.Marshal()
+	if err != nil {
+		e.logf("error generating TSMP Advertisement: %s", err)
+		metricTSMPDiscoKeyAdvertisementError.Add(1)
+	} else if err := e.tundev.InjectOutbound(payload); err != nil {
+		e.logf("error sending TSMP Advertisement: %s", err)
+		metricTSMPDiscoKeyAdvertisementError.Add(1)
+	} else {
+		metricTSMPDiscoKeyAdvertisementSent.Add(1)
+	}
 }
 
 func (e *userspaceEngine) setTSMPPongCallback(data [8]byte, cb func(packet.TSMPPongReply)) {
@@ -1686,6 +1931,11 @@ var (
 
 	metricNumMajorChanges = clientmetric.NewCounter("wgengine_major_changes")
 	metricNumMinorChanges = clientmetric.NewCounter("wgengine_minor_changes")
+
+	metricTSMPDiscoKeyAdvertisementSent  = clientmetric.NewCounter("magicsock_tsmp_disco_key_advertisement_sent")
+	metricTSMPDiscoKeyAdvertisementError = clientmetric.NewCounter("magicsock_tsmp_disco_key_advertisement_error")
+
+	metricTSMPLearnedKeyMismatch = clientmetric.NewCounter("magicsock_tsmp_learned_key_mismatch")
 )
 
 func (e *userspaceEngine) InstallCaptureHook(cb packet.CaptureCallback) {

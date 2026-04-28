@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package taildrop
@@ -139,8 +139,8 @@ func (e *Extension) onChangeProfile(profile ipn.LoginProfileView, _ ipn.PrefsVie
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	uid := profile.UserProfile().ID
-	activeLogin := profile.UserProfile().LoginName
+	uid := profile.UserProfile().ID()
+	activeLogin := profile.UserProfile().LoginName()
 
 	if uid == 0 {
 		e.setMgrLocked(nil)

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package controlclient
@@ -23,6 +23,7 @@ import (
 	"tailscale.com/util/backoff"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/execqueue"
+	"tailscale.com/util/testenv"
 )
 
 type LoginGoal struct {
@@ -90,7 +91,7 @@ func (c *Auto) updateRoutine() {
 			bo.BackOff(ctx, err)
 			continue
 		}
-		bo.BackOff(ctx, nil)
+		bo.Reset()
 		c.direct.logf("[v1] successful lite map update in %v", d)
 
 		lastUpdateGenInformed = gen
@@ -117,12 +118,13 @@ type Auto struct {
 	logf          logger.Logf
 	closed        bool
 	updateCh      chan struct{} // readable when we should inform the server of a change
-	observer      Observer      // called to update Client status; always non-nil
+	observer      Observer      // if non-nil, called to update Client status
 	observerQueue execqueue.ExecQueue
 	shutdownFn    func() // to be called prior to shutdown or nil
 
 	mu sync.Mutex // mutex guards the following fields
 
+	started      bool   // whether [Auto.Start] has been called
 	wantLoggedIn bool   // whether the user wants to be logged in per last method call
 	urlToVisit   string // the last url we were told to visit
 	expiry       time.Time
@@ -138,7 +140,6 @@ type Auto struct {
 	loggedIn       bool        // true if currently logged in
 	loginGoal      *LoginGoal  // non-nil if some login activity is desired
 	inMapPoll      bool        // true once we get the first MapResponse in a stream; false when HTTP response ends
-	state          State       // TODO(bradfitz): delete this, make it computed by method from other state
 
 	authCtx    context.Context // context used for auth requests
 	mapCtx     context.Context // context used for netmap and update requests
@@ -151,15 +152,21 @@ type Auto struct {
 
 // New creates and starts a new Auto.
 func New(opts Options) (*Auto, error) {
-	c, err := NewNoStart(opts)
-	if c != nil {
-		c.Start()
+	c, err := newNoStart(opts)
+	if err != nil {
+		return nil, err
+	}
+	if opts.StartPaused {
+		c.SetPaused(true)
+	}
+	if !opts.SkipStartForTests {
+		c.start()
 	}
 	return c, err
 }
 
-// NewNoStart creates a new Auto, but without calling Start on it.
-func NewNoStart(opts Options) (_ *Auto, err error) {
+// newNoStart creates a new Auto, but without calling Start on it.
+func newNoStart(opts Options) (_ *Auto, err error) {
 	direct, err := NewDirect(opts)
 	if err != nil {
 		return nil, err
@@ -170,9 +177,6 @@ func NewNoStart(opts Options) (_ *Auto, err error) {
 		}
 	}()
 
-	if opts.Observer == nil {
-		return nil, errors.New("missing required Options.Observer")
-	}
 	if opts.Logf == nil {
 		opts.Logf = func(fmt string, args ...any) {}
 	}
@@ -222,10 +226,21 @@ func (c *Auto) SetPaused(paused bool) {
 	c.unpauseWaiters = nil
 }
 
-// Start starts the client's goroutines.
+// StartForTest starts the client's goroutines.
 //
-// It should only be called for clients created by NewNoStart.
-func (c *Auto) Start() {
+// It should only be called for clients created with [Options.SkipStartForTests].
+func (c *Auto) StartForTest() {
+	testenv.AssertInTest()
+	c.start()
+}
+
+func (c *Auto) start() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.started {
+		return
+	}
+	c.started = true
 	go c.authRoutine()
 	go c.mapRoutine()
 	go c.updateRoutine()
@@ -299,10 +314,11 @@ func (c *Auto) authRoutine() {
 		c.mu.Lock()
 		goal := c.loginGoal
 		ctx := c.authCtx
+		loggedIn := c.loggedIn
 		if goal != nil {
-			c.logf("[v1] authRoutine: %s; wantLoggedIn=%v", c.state, true)
+			c.logf("[v1] authRoutine: loggedIn=%v; wantLoggedIn=%v", loggedIn, true)
 		} else {
-			c.logf("[v1] authRoutine: %s; goal=nil paused=%v", c.state, c.paused)
+			c.logf("[v1] authRoutine: loggedIn=%v; goal=nil paused=%v", loggedIn, c.paused)
 		}
 		c.mu.Unlock()
 
@@ -325,11 +341,6 @@ func (c *Auto) authRoutine() {
 
 		c.mu.Lock()
 		c.urlToVisit = goal.url
-		if goal.url != "" {
-			c.state = StateURLVisitRequired
-		} else {
-			c.state = StateAuthenticating
-		}
 		c.mu.Unlock()
 
 		var url string
@@ -345,7 +356,15 @@ func (c *Auto) authRoutine() {
 		if err != nil {
 			c.direct.health.SetAuthRoutineInError(err)
 			report(err, f)
-			bo.BackOff(ctx, err)
+			if rle, ok := errors.AsType[*rateLimitError](err); ok {
+				c.logf("authRoutine: %s", rle)
+				select {
+				case <-ctx.Done():
+				case <-time.After(rle.retryAfter):
+				}
+			} else {
+				bo.BackOff(ctx, err)
+			}
 			continue
 		}
 		if url != "" {
@@ -363,7 +382,6 @@ func (c *Auto) authRoutine() {
 				flags: LoginDefault,
 				url:   url,
 			}
-			c.state = StateURLVisitRequired
 			c.mu.Unlock()
 
 			c.sendStatus("authRoutine-url", err, url, nil)
@@ -372,7 +390,7 @@ func (c *Auto) authRoutine() {
 				// backoff to avoid a busy loop.
 				bo.BackOff(ctx, errors.New("login URL not changing"))
 			} else {
-				bo.BackOff(ctx, nil)
+				bo.Reset()
 			}
 			continue
 		}
@@ -383,12 +401,11 @@ func (c *Auto) authRoutine() {
 		c.urlToVisit = ""
 		c.loggedIn = true
 		c.loginGoal = nil
-		c.state = StateAuthenticated
 		c.mu.Unlock()
 
 		c.sendStatus("authRoutine-success", nil, "", nil)
 		c.restartMap()
-		bo.BackOff(ctx, nil)
+		bo.Reset()
 	}
 }
 
@@ -434,19 +451,17 @@ func (mrs mapRoutineState) UpdateFullNetmap(nm *netmap.NetworkMap) {
 
 	c.mu.Lock()
 	c.inMapPoll = true
-	if c.loggedIn {
-		c.state = StateSynchronized
-	}
-	c.expiry = nm.Expiry
+	c.expiry = nm.SelfKeyExpiry()
 	stillAuthed := c.loggedIn
-	c.logf("[v1] mapRoutine: netmap received: %s", c.state)
+	c.logf("[v1] mapRoutine: netmap received: loggedIn=%v inMapPoll=true", stillAuthed)
+
+	// Reset the backoff timer if we got a netmap.
+	mrs.bo.Reset()
 	c.mu.Unlock()
 
 	if stillAuthed {
 		c.sendStatus("mapRoutine-got-netmap", nil, "", nm)
 	}
-	// Reset the backoff timer if we got a netmap.
-	mrs.bo.Reset()
 }
 
 func (mrs mapRoutineState) UpdateNetmapDelta(muts []netmap.NodeMutation) bool {
@@ -471,6 +486,27 @@ func (mrs mapRoutineState) UpdateNetmapDelta(muts []netmap.NodeMutation) bool {
 	return err == nil && ok
 }
 
+var _ patchDiscoKeyer = mapRoutineState{}
+
+func (mrs mapRoutineState) PatchDiscoKey(pub key.NodePublic, disco key.DiscoPublic) {
+	c := mrs.c
+	c.mu.Lock()
+	goodState := c.loggedIn && c.inMapPoll
+	dun, ok := c.observer.(patchDiscoKeyer)
+	c.mu.Unlock()
+
+	if !goodState || !ok {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.mapCtx, 2*time.Second)
+	defer cancel()
+
+	c.observerQueue.RunSync(ctx, func() {
+		dun.PatchDiscoKey(pub, disco)
+	})
+}
+
 // mapRoutine is responsible for keeping a read-only streaming connection to the
 // control server, and keeping the netmap up to date.
 func (c *Auto) mapRoutine() {
@@ -487,8 +523,8 @@ func (c *Auto) mapRoutine() {
 		}
 
 		c.mu.Lock()
-		c.logf("[v1] mapRoutine: %s", c.state)
 		loggedIn := c.loggedIn
+		c.logf("[v1] mapRoutine: loggedIn=%v", loggedIn)
 		ctx := c.mapCtx
 		c.mu.Unlock()
 
@@ -519,17 +555,19 @@ func (c *Auto) mapRoutine() {
 		c.direct.health.SetOutOfPollNetMap()
 		c.mu.Lock()
 		c.inMapPoll = false
-		if c.state == StateSynchronized {
-			c.state = StateAuthenticated
-		}
 		paused := c.paused
-		c.mu.Unlock()
 
 		if paused {
-			mrs.bo.BackOff(ctx, nil)
-			c.logf("mapRoutine: paused")
+			mrs.bo.Reset()
 		} else {
 			mrs.bo.BackOff(ctx, err)
+		}
+		c.mu.Unlock()
+
+		// Now safe to call functions that might acquire the mutex
+		if paused {
+			c.logf("mapRoutine: paused")
+		} else {
 			report(err, "PollNetMap")
 		}
 	}
@@ -587,12 +625,12 @@ func (c *Auto) sendStatus(who string, err error, url string, nm *netmap.NetworkM
 		c.mu.Unlock()
 		return
 	}
-	state := c.state
 	loggedIn := c.loggedIn
 	inMapPoll := c.inMapPoll
+	loginGoal := c.loginGoal
 	c.mu.Unlock()
 
-	c.logf("[v1] sendStatus: %s: %v", who, state)
+	c.logf("[v1] sendStatus: %s: loggedIn=%v inMapPoll=%v", who, loggedIn, inMapPoll)
 
 	var p persist.PersistView
 	if nm != nil && loggedIn && inMapPoll {
@@ -603,18 +641,31 @@ func (c *Auto) sendStatus(who string, err error, url string, nm *netmap.NetworkM
 		nm = nil
 	}
 	newSt := &Status{
-		URL:     url,
-		Persist: p,
-		NetMap:  nm,
-		Err:     err,
-		state:   state,
+		URL:       url,
+		Persist:   p,
+		NetMap:    nm,
+		Err:       err,
+		LoggedIn:  loggedIn && loginGoal == nil,
+		InMapPoll: inMapPoll,
 	}
+
+	if c.observer == nil {
+		return
+	}
+
 	c.lastStatus.Store(newSt)
 
 	// Launch a new goroutine to avoid blocking the caller while the observer
 	// does its thing, which may result in a call back into the client.
 	metricQueued.Add(1)
 	c.observerQueue.Add(func() {
+		c.mu.Lock()
+		closed := c.closed
+		c.mu.Unlock()
+		if closed {
+			return
+		}
+
 		if canSkipStatus(newSt, c.lastStatus.Load()) {
 			metricSkippable.Add(1)
 			if !c.direct.controlKnobs.DisableSkipStatusQueue.Load() {
@@ -659,15 +710,15 @@ func canSkipStatus(s1, s2 *Status) bool {
 		return false
 	}
 	if s1.Err != nil || s1.URL != "" {
-		// If s1 has an error or a URL, we shouldn't skip it, lest the error go
+		// If s1 has an error or an URL, we shouldn't skip it, lest the error go
 		// away in s2 or in-between. We want to make sure all the subsystems see
 		// it. Plus there aren't many of these, so not worth skipping.
 		return false
 	}
-	if !s1.Persist.Equals(s2.Persist) || s1.state != s2.state {
-		// If s1 has a different Persist or state than s2,
-		// don't skip it. We only care about skipping the typical
-		// entries where the only difference is the NetMap.
+	if !s1.Persist.Equals(s2.Persist) || s1.LoggedIn != s2.LoggedIn || s1.InMapPoll != s2.InMapPoll || s1.URL != s2.URL {
+		// If s1 has a different Persist, has changed login state, changed map
+		// poll state, or has a new login URL, don't skip it. We only care about
+		// skipping the typical entries where the only difference is the NetMap.
 		return false
 	}
 	// If nothing above precludes it, and both s1 and s2 have NetMaps, then
@@ -727,7 +778,6 @@ func (c *Auto) Logout(ctx context.Context) error {
 	}
 	c.mu.Lock()
 	c.loggedIn = false
-	c.state = StateNotAuthenticated
 	c.cancelAuthCtxLocked()
 	c.cancelMapCtxLocked()
 	c.mu.Unlock()
@@ -749,6 +799,22 @@ func (c *Auto) UpdateEndpoints(endpoints []tailcfg.Endpoint) {
 	if changed {
 		c.updateControl()
 	}
+}
+
+// SetDiscoPublicKey sets the client's Disco public to key and sends the change
+// to the control server.
+func (c *Auto) SetDiscoPublicKey(key key.DiscoPublic) {
+	c.direct.SetDiscoPublicKey(key)
+	c.updateControl()
+}
+
+// SetIPForwardingBroken updates the IP forwarding broken state and sends
+// a control update if the value changed.
+func (c *Auto) SetIPForwardingBroken(v bool) {
+	if !c.direct.SetIPForwardingBroken(v) {
+		return
+	}
+	c.updateControl()
 }
 
 func (c *Auto) Shutdown() {

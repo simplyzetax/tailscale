@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package policytest contains test helpers for the syspolicy packages.
@@ -89,12 +89,7 @@ func (pc policyChanges) HasChanged(v pkey.Key) bool {
 	return ok
 }
 func (pc policyChanges) HasChangedAnyOf(keys ...pkey.Key) bool {
-	for _, k := range keys {
-		if pc.HasChanged(k) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(keys, pc.HasChanged)
 }
 
 const watchersKey = "_policytest_watchers"

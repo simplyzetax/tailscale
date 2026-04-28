@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package tka
@@ -16,8 +16,8 @@ func TestGenerateDeeplink(t *testing.T) {
         G1.template = genesis
     `,
 		optTemplate("genesis", AUM{MessageKind: AUMCheckpoint, State: &State{
-			Keys:               []Key{key},
-			DisablementSecrets: [][]byte{DisablementKDF([]byte{1, 2, 3})},
+			Keys:              []Key{key},
+			DisablementValues: [][]byte{DisablementKDF([]byte{1, 2, 3})},
 		}}),
 	)
 	a, _ := Open(c.Chonk())

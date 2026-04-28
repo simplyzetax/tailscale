@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package magicsock
@@ -22,11 +22,15 @@ func TestRelayManagerInitAndIdle(t *testing.T) {
 	<-rm.runLoopStoppedCh
 
 	rm = relayManager{}
-	rm.handleCallMeMaybeVia(&endpoint{c: &Conn{discoPrivate: key.NewDisco()}}, addrQuality{}, false, &disco.CallMeMaybeVia{UDPRelayEndpoint: disco.UDPRelayEndpoint{ServerDisco: key.NewDisco().Public()}})
+	c1 := &Conn{}
+	c1.discoAtomic.Set(key.NewDisco())
+	rm.handleCallMeMaybeVia(&endpoint{c: c1}, addrQuality{}, false, &disco.CallMeMaybeVia{UDPRelayEndpoint: disco.UDPRelayEndpoint{ServerDisco: key.NewDisco().Public()}})
 	<-rm.runLoopStoppedCh
 
 	rm = relayManager{}
-	rm.handleRxDiscoMsg(&Conn{discoPrivate: key.NewDisco()}, &disco.BindUDPRelayEndpointChallenge{}, key.NodePublic{}, key.DiscoPublic{}, epAddr{})
+	c2 := &Conn{}
+	c2.discoAtomic.Set(key.NewDisco())
+	rm.handleRxDiscoMsg(c2, &disco.BindUDPRelayEndpointChallenge{}, key.NodePublic{}, key.DiscoPublic{}, epAddr{})
 	<-rm.runLoopStoppedCh
 
 	rm = relayManager{}
@@ -137,7 +141,7 @@ func TestRelayManager_handleNewServerEndpointRunLoop(t *testing.T) {
 	}{
 		{
 			// Test for http://go/corp/32978
-			name: "eq server+ep neq VNI higher lamport",
+			name: "eq-server-ep-neq-VNI-higher-lamport",
 			events: []newRelayServerEndpointEvent{
 				serverAendpointALamport1VNI1,
 				serverAendpointALamport2VNI2,
@@ -147,7 +151,7 @@ func TestRelayManager_handleNewServerEndpointRunLoop(t *testing.T) {
 			},
 		},
 		{
-			name: "eq server+ep neq VNI lower lamport",
+			name: "eq-server-ep-neq-VNI-lower-lamport",
 			events: []newRelayServerEndpointEvent{
 				serverAendpointALamport2VNI2,
 				serverAendpointALamport1VNI1,
@@ -157,7 +161,7 @@ func TestRelayManager_handleNewServerEndpointRunLoop(t *testing.T) {
 			},
 		},
 		{
-			name: "eq server+vni neq ep lower lamport",
+			name: "eq-server-vni-neq-ep-lower-lamport",
 			events: []newRelayServerEndpointEvent{
 				serverAendpointALamport2VNI2,
 				serverAendpointBLamport1VNI2,
@@ -167,7 +171,7 @@ func TestRelayManager_handleNewServerEndpointRunLoop(t *testing.T) {
 			},
 		},
 		{
-			name: "eq server+vni neq ep higher lamport",
+			name: "eq-server-vni-neq-ep-higher-lamport",
 			events: []newRelayServerEndpointEvent{
 				serverAendpointBLamport1VNI2,
 				serverAendpointALamport2VNI2,
@@ -177,7 +181,7 @@ func TestRelayManager_handleNewServerEndpointRunLoop(t *testing.T) {
 			},
 		},
 		{
-			name: "eq server+endpoint+vni higher lamport",
+			name: "eq-server-endpoint-vni-higher-lamport",
 			events: []newRelayServerEndpointEvent{
 				serverAendpointALamport1VNI1,
 				serverAendpointALamport2VNI1,
@@ -187,7 +191,7 @@ func TestRelayManager_handleNewServerEndpointRunLoop(t *testing.T) {
 			},
 		},
 		{
-			name: "eq server+endpoint+vni lower lamport",
+			name: "eq-server-endpoint-vni-lower-lamport",
 			events: []newRelayServerEndpointEvent{
 				serverAendpointALamport2VNI1,
 				serverAendpointALamport1VNI1,
@@ -197,7 +201,7 @@ func TestRelayManager_handleNewServerEndpointRunLoop(t *testing.T) {
 			},
 		},
 		{
-			name: "eq endpoint+vni+lamport neq server",
+			name: "eq-endpoint-vni-lamport-neq-server",
 			events: []newRelayServerEndpointEvent{
 				serverAendpointALamport1VNI1,
 				serverBendpointALamport1VNI1,
@@ -208,7 +212,7 @@ func TestRelayManager_handleNewServerEndpointRunLoop(t *testing.T) {
 			},
 		},
 		{
-			name: "trusted last best with matching server",
+			name: "trusted-last-best-with-matching-server",
 			events: []newRelayServerEndpointEvent{
 				serverAendpointALamport1VNI1LastBestMatching,
 			},

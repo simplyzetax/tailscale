@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // The derper binary is a simple DERP server.
@@ -60,9 +60,12 @@ var (
 	httpPort    = flag.Int("http-port", 80, "The port on which to serve HTTP. Set to -1 to disable. The listener is bound to the same IP (if any) as specified in the -a flag.")
 	stunPort    = flag.Int("stun-port", 3478, "The UDP port on which to serve STUN. The listener is bound to the same IP (if any) as specified in the -a flag.")
 	configPath  = flag.String("c", "", "config file path")
-	certMode    = flag.String("certmode", "letsencrypt", "mode for getting a cert. possible options: manual, letsencrypt")
-	certDir     = flag.String("certdir", tsweb.DefaultCertDir("derper-certs"), "directory to store LetsEncrypt certs, if addr's port is :443")
-	hostname    = flag.String("hostname", "derp.tailscale.com", "LetsEncrypt host name, if addr's port is :443. When --certmode=manual, this can be an IP address to avoid SNI checks")
+	certMode    = flag.String("certmode", "letsencrypt", "mode for getting a cert. possible options: manual, letsencrypt, gcp")
+	certDir     = flag.String("certdir", tsweb.DefaultCertDir("derper-certs"), "directory to store ACME (e.g. LetsEncrypt) certs, if addr's port is :443")
+	hostname    = flag.String("hostname", "derp.tailscale.com", "TLS host name for certs, if addr's port is :443. When --certmode=manual, this can be an IP address to avoid SNI checks")
+	acmeEABKid  = flag.String("acme-eab-kid", "", "ACME External Account Binding (EAB) Key ID (required for --certmode=gcp)")
+	acmeEABKey  = flag.String("acme-eab-key", "", "ACME External Account Binding (EAB) HMAC key, base64-encoded (required for --certmode=gcp)")
+	acmeEmail   = flag.String("acme-email", "", "ACME account contact email address (required for --certmode=gcp, optional for letsencrypt)")
 	runSTUN     = flag.Bool("stun", true, "whether to run a STUN server. It will bind to the same IP (if any) as the --addr flag value.")
 	runDERP     = flag.Bool("derp", true, "whether to run a DERP server. The only reason to set this false is if you're decommissioning a server but want to keep its bootstrap DNS functionality still running.")
 	flagHome    = flag.String("home", "", "what to serve at the root path. It may be left empty (the default, for a default homepage), \"blank\" for a blank page, or a URL to redirect to")
@@ -84,6 +87,8 @@ var (
 	acceptConnLimit = flag.Float64("accept-connection-limit", math.Inf(+1), "rate limit for accepting new connection")
 	acceptConnBurst = flag.Int("accept-connection-burst", math.MaxInt, "burst limit for accepting new connection")
 
+	rateConfigPath = flag.String("rate-config", "", "if non-empty, path to JSON rate limit config file. Rate limiting is experimental and subject to change. Configuration is reloaded on SIGHUP.")
+
 	// tcpKeepAlive is intentionally long, to reduce battery cost. There is an L7 keepalive on a higher frequency schedule.
 	tcpKeepAlive = flag.Duration("tcp-keepalive-time", 10*time.Minute, "TCP keepalive time")
 	// tcpUserTimeout is intentionally short, so that hung connections are cleaned up promptly. DERPs should be nearby users.
@@ -96,17 +101,12 @@ var (
 )
 
 var (
-	tlsRequestVersion = &metrics.LabelMap{Label: "version"}
-	tlsActiveVersion  = &metrics.LabelMap{Label: "version"}
+	tlsRequestVersion = metrics.NewLabelMap("derper_tls_request_version", "version")
+	tlsActiveVersion  = metrics.NewLabelMap("gauge_derper_tls_active_version", "version")
 )
 
 const setecMeshKeyName = "meshkey"
 const meshKeyEnvVar = "TAILSCALE_DERPER_MESH_KEY"
-
-func init() {
-	expvar.Publish("derper_tls_request_version", tlsRequestVersion)
-	expvar.Publish("gauge_derper_tls_active_version", tlsActiveVersion)
-}
 
 type config struct {
 	PrivateKey key.NodePrivate
@@ -194,6 +194,12 @@ func main() {
 	s.SetVerifyClientURL(*verifyClientURL)
 	s.SetVerifyClientURLFailOpen(*verifyFailOpen)
 	s.SetTCPWriteTimeout(*tcpWriteTimeout)
+	if *rateConfigPath != "" {
+		if err := s.LoadAndApplyRateConfig(*rateConfigPath); err != nil {
+			log.Fatalf("derper: loading rate config: %v", err)
+		}
+		go watchRateConfig(ctx, s, *rateConfigPath)
+	}
 
 	var meshKey string
 	if *dev {
@@ -343,7 +349,7 @@ func main() {
 	if serveTLS {
 		log.Printf("derper: serving on %s with TLS", *addr)
 		var certManager certProvider
-		certManager, err = certProviderByCertMode(*certMode, *certDir, *hostname)
+		certManager, err = certProviderByCertMode(*certMode, *certDir, *hostname, *acmeEABKid, *acmeEABKey, *acmeEmail)
 		if err != nil {
 			log.Fatalf("derper: can not start cert provider: %v", err)
 		}
@@ -428,6 +434,27 @@ func main() {
 	}
 }
 
+// watchRateConfig listens for SIGHUP signals and reloads the rate config
+// file on each signal, applying it to the server. It returns when ctx is done.
+func watchRateConfig(ctx context.Context, s *derpserver.Server, path string) {
+	sighup := make(chan os.Signal, 1)
+	signal.Notify(sighup, syscall.SIGHUP)
+	defer signal.Stop(sighup)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-sighup:
+			log.Printf("derper: received SIGHUP, reloading rate config from %s", path)
+			if err := s.LoadAndApplyRateConfig(path); err != nil {
+				log.Printf("derper: rate config reload failed: %v", err)
+				continue
+			}
+			log.Printf("derper: rate config reloaded successfully")
+		}
+	}
+}
+
 var validProdHostname = regexp.MustCompile(`^derp([^.]*)\.tailscale\.com\.?$`)
 
 func prodAutocertHostPolicy(_ context.Context, host string) error {
@@ -481,32 +508,32 @@ func newRateLimitedListener(ln net.Listener, limit rate.Limit, burst int) *rateL
 	return &rateLimitedListener{Listener: ln, lim: rate.NewLimiter(limit, burst)}
 }
 
-func (l *rateLimitedListener) ExpVar() expvar.Var {
+func (ln *rateLimitedListener) ExpVar() expvar.Var {
 	m := new(metrics.Set)
-	m.Set("counter_accepted_connections", &l.numAccepts)
-	m.Set("counter_rejected_connections", &l.numRejects)
+	m.Set("counter_accepted_connections", &ln.numAccepts)
+	m.Set("counter_rejected_connections", &ln.numRejects)
 	return m
 }
 
 var errLimitedConn = errors.New("cannot accept connection; rate limited")
 
-func (l *rateLimitedListener) Accept() (net.Conn, error) {
+func (ln *rateLimitedListener) Accept() (net.Conn, error) {
 	// Even under a rate limited situation, we accept the connection immediately
 	// and close it, rather than being slow at accepting new connections.
 	// This provides two benefits: 1) it signals to the client that something
 	// is going on on the server, and 2) it prevents new connections from
 	// piling up and occupying resources in the OS kernel.
 	// The client will retry as needing (with backoffs in place).
-	cn, err := l.Listener.Accept()
+	cn, err := ln.Listener.Accept()
 	if err != nil {
 		return nil, err
 	}
-	if !l.lim.Allow() {
-		l.numRejects.Add(1)
+	if !ln.lim.Allow() {
+		ln.numRejects.Add(1)
 		cn.Close()
 		return nil, errLimitedConn
 	}
-	l.numAccepts.Add(1)
+	ln.numAccepts.Add(1)
 	return cn, nil
 }
 

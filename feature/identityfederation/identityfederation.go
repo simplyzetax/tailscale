@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package identityfederation registers support for using ID tokens to
@@ -19,21 +19,30 @@ import (
 	"tailscale.com/feature"
 	"tailscale.com/internal/client/tailscale"
 	"tailscale.com/ipn"
+	"tailscale.com/wif"
 )
 
 func init() {
 	feature.Register("identityfederation")
 	tailscale.HookResolveAuthKeyViaWIF.Set(resolveAuthKey)
+	tailscale.HookExchangeJWTForTokenViaWIF.Set(exchangeJWTForToken)
 }
 
 // resolveAuthKey uses OIDC identity federation to exchange the provided ID token and client ID for an authkey.
-func resolveAuthKey(ctx context.Context, baseURL, clientID, idToken string, tags []string) (string, error) {
+func resolveAuthKey(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error) {
 	if clientID == "" {
 		return "", nil // Short-circuit, no client ID means not using identity federation
 	}
 
 	if idToken == "" {
-		return "", errors.New("federated identity authkeys require --id-token")
+		if audience == "" {
+			return "", errors.New("federated identity requires either an ID token or an audience")
+		}
+		providerIdToken, err := wif.ObtainProviderToken(ctx, audience)
+		if err != nil {
+			return "", errors.New("federated identity authkeys require --id-token")
+		}
+		idToken = providerIdToken
 	}
 	if len(tags) == 0 {
 		return "", errors.New("federated identity authkeys require --advertise-tags")
@@ -119,8 +128,7 @@ func exchangeJWTForToken(ctx context.Context, baseURL, clientID, idToken string)
 	}).Exchange(ctx, "", oauth2.SetAuthURLParam("client_id", clientID), oauth2.SetAuthURLParam("jwt", idToken))
 	if err != nil {
 		// Try to extract more detailed error message
-		var retrieveErr *oauth2.RetrieveError
-		if errors.As(err, &retrieveErr) {
+		if retrieveErr, ok := errors.AsType[*oauth2.RetrieveError](err); ok {
 			return "", fmt.Errorf("token exchange failed with status %d: %s", retrieveErr.Response.StatusCode, string(retrieveErr.Body))
 		}
 		return "", fmt.Errorf("unexpected token exchange request error: %w", err)

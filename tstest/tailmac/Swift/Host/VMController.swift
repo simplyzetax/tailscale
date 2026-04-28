@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 import Cocoa
@@ -81,7 +81,7 @@ class VMController: NSObject, VZVirtualMachineDelegate {
         return macPlatform
     }
 
-    func createVirtualMachine() {
+    func createVirtualMachine(headless: Bool = false, disconnectedNIC: Bool = false) {
         let virtualMachineConfiguration = VZVirtualMachineConfiguration()
 
         virtualMachineConfiguration.platform = createMacPlaform()
@@ -90,7 +90,18 @@ class VMController: NSObject, VZVirtualMachineDelegate {
         virtualMachineConfiguration.memorySize = helper.computeMemorySize()
         virtualMachineConfiguration.graphicsDevices = [helper.createGraphicsDeviceConfiguration()]
         virtualMachineConfiguration.storageDevices = [helper.createBlockDeviceConfiguration()]
-        virtualMachineConfiguration.networkDevices = [helper.createNetworkDeviceConfiguration(), helper.createSocketNetworkDeviceConfiguration()]
+        if headless {
+            if disconnectedNIC {
+                // Create a NIC with no attachment. The NIC exists in the hardware
+                // config (so saved state is compatible) but appears disconnected.
+                // Call attachNetwork() after restore to hot-swap the attachment.
+                virtualMachineConfiguration.networkDevices = [helper.createDisconnectedNetworkDeviceConfiguration()]
+            } else {
+                virtualMachineConfiguration.networkDevices = [helper.createSocketNetworkDeviceConfiguration()]
+            }
+        } else {
+            virtualMachineConfiguration.networkDevices = [helper.createNetworkDeviceConfiguration(), helper.createSocketNetworkDeviceConfiguration()]
+        }
         virtualMachineConfiguration.pointingDevices = [helper.createPointingDeviceConfiguration()]
         virtualMachineConfiguration.keyboards = [helper.createKeyboardConfiguration()]
         virtualMachineConfiguration.socketDevices = [helper.createSocketDeviceConfiguration()]
@@ -107,6 +118,22 @@ class VMController: NSObject, VZVirtualMachineDelegate {
 
         virtualMachine = VZVirtualMachine(configuration: virtualMachineConfiguration)
         virtualMachine.delegate = self
+    }
+
+    /// Hot-swap the NIC attachment on a running VM. The VM must have been
+    /// created with disconnectedNIC=true. After calling this, the guest
+    /// sees the link come up and does DHCP.
+    func attachNetwork(serverSocket: String, clientID: String) {
+        guard let nic = virtualMachine.networkDevices.first else {
+            print("attachNetwork: no network devices")
+            return
+        }
+        guard let attachment = helper.createDgramAttachment(serverSocket: serverSocket, clientID: clientID) else {
+            print("attachNetwork: failed to create attachment")
+            return
+        }
+        nic.attachment = attachment
+        print("attachNetwork: NIC attachment swapped to \(serverSocket)")
     }
 
 

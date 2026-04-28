@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package netstack
@@ -15,6 +15,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"tailscale.com/envknob"
@@ -31,6 +32,8 @@ import (
 	"tailscale.com/tstest"
 	"tailscale.com/types/ipproto"
 	"tailscale.com/types/logid"
+	"tailscale.com/types/netmap"
+	"tailscale.com/util/clientmetric"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/filter"
 )
@@ -125,6 +128,7 @@ func makeNetstack(tb testing.TB, config func(*Impl)) *Impl {
 		tb.Fatal(err)
 	}
 	tb.Cleanup(func() { ns.Close() })
+	sys.Set(ns)
 
 	lb, err := ipnlocal.NewLocalBackend(logf, logid.PublicID{}, sys, 0)
 	if err != nil {
@@ -450,6 +454,194 @@ func TestShouldProcessInbound(t *testing.T) {
 			},
 			want: false,
 		},
+		{
+			name: "udp-on-service-vip-with-listener-ipv4",
+			pkt: &packet.Parsed{
+				IPVersion: 4,
+				IPProto:   ipproto.UDP,
+				Src:       netip.MustParseAddrPort("100.101.102.103:1234"),
+				Dst:       netip.MustParseAddrPort("100.100.100.100:8080"),
+			},
+			beforeStart: func(i *Impl) {
+				i.ProcessLocalIPs = false
+				i.ProcessSubnets = false
+			},
+			afterStart: func(i *Impl) {
+				IPServiceMap := netmap.IPServiceMappings{
+					serviceIP: "svc:test-service",
+				}
+				i.lb.SetIPServiceMappingsForTest(IPServiceMap)
+
+				i.atomicIsVIPServiceIPFunc.Store(func(addr netip.Addr) bool {
+					return addr == serviceIP
+				})
+
+				// Register the service VIP address on the NIC so gVisor can route to it
+				protocolAddr := tcpip.ProtocolAddress{
+					Protocol:          header.IPv4ProtocolNumber,
+					AddressWithPrefix: tcpip.AddrFrom4(serviceIP.As4()).WithPrefix(),
+				}
+
+				if err := i.ipstack.AddProtocolAddress(nicID, protocolAddr, stack.AddressProperties{}); err != nil {
+					t.Fatalf("AddProtocolAddress: %v", err)
+				}
+
+				// Create a UDP listener on the service VIP
+				pc, err := gonet.DialUDP(i.ipstack, &tcpip.FullAddress{
+					NIC:  nicID,
+					Addr: tcpip.AddrFrom4(serviceIP.As4()),
+					Port: 8080,
+				}, nil, header.IPv4ProtocolNumber)
+				if err != nil {
+					t.Fatalf("DialUDP: %v", err)
+				}
+				t.Cleanup(func() { pc.Close() })
+
+				i.atomicIsLocalIPFunc.Store(looksLikeATailscaleSelfAddress)
+			},
+			want: true,
+		},
+		{
+			name: "udp-on-service-vip-no-listener-ipv4",
+			pkt: &packet.Parsed{
+				IPVersion: 4,
+				IPProto:   ipproto.UDP,
+				Src:       netip.MustParseAddrPort("100.101.102.103:1234"),
+				Dst:       netip.MustParseAddrPort("100.100.100.100:9999"),
+			},
+			beforeStart: func(i *Impl) {
+				i.ProcessLocalIPs = false
+				i.ProcessSubnets = false
+			},
+			afterStart: func(i *Impl) {
+				IPServiceMap := netmap.IPServiceMappings{
+					serviceIP: "svc:test-service",
+				}
+				i.lb.SetIPServiceMappingsForTest(IPServiceMap)
+
+				i.atomicIsVIPServiceIPFunc.Store(func(addr netip.Addr) bool {
+					return addr == serviceIP
+				})
+
+				i.atomicIsLocalIPFunc.Store(looksLikeATailscaleSelfAddress)
+			},
+			want: false,
+		},
+		{
+			name: "udp-on-service-vip-with-listener-ipv6",
+			pkt: &packet.Parsed{
+				IPVersion: 6,
+				IPProto:   ipproto.UDP,
+				Src:       netip.MustParseAddrPort("[fd7a:115c:a1e0::1]:1234"),
+				Dst:       netip.MustParseAddrPort("[fd7a:115c:a1e0::53]:8080"),
+			},
+			beforeStart: func(i *Impl) {
+				i.ProcessLocalIPs = false
+				i.ProcessSubnets = false
+			},
+			afterStart: func(i *Impl) {
+				IPServiceMap := netmap.IPServiceMappings{
+					serviceIPv6: "svc:test-service",
+				}
+				i.lb.SetIPServiceMappingsForTest(IPServiceMap)
+
+				i.atomicIsVIPServiceIPFunc.Store(func(addr netip.Addr) bool {
+					return addr == serviceIPv6
+				})
+
+				protocolAddr := tcpip.ProtocolAddress{
+					Protocol:          header.IPv6ProtocolNumber,
+					AddressWithPrefix: tcpip.AddrFrom16(serviceIPv6.As16()).WithPrefix(),
+				}
+				if err := i.ipstack.AddProtocolAddress(nicID, protocolAddr, stack.AddressProperties{}); err != nil {
+					t.Fatalf("AddProtocolAddress: %v", err)
+				}
+
+				pc, err := gonet.DialUDP(i.ipstack, &tcpip.FullAddress{
+					NIC:  nicID,
+					Addr: tcpip.AddrFrom16(serviceIPv6.As16()),
+					Port: 8080,
+				}, nil, header.IPv6ProtocolNumber)
+				if err != nil {
+					t.Fatalf("DialUDP: %v", err)
+				}
+				t.Cleanup(func() { pc.Close() })
+
+				i.atomicIsLocalIPFunc.Store(looksLikeATailscaleSelfAddress)
+			},
+			want: true,
+		},
+		{
+			name: "udp-on-service-vip-no-listener-ipv6",
+			pkt: &packet.Parsed{
+				IPVersion: 6,
+				IPProto:   ipproto.UDP,
+				Src:       netip.MustParseAddrPort("[fd7a:115c:a1e0::1]:1234"),
+				Dst:       netip.AddrPortFrom(serviceIPv6, 9999),
+			},
+			beforeStart: func(i *Impl) {
+				i.ProcessLocalIPs = false
+				i.ProcessSubnets = false
+			},
+			afterStart: func(i *Impl) {
+				IPServiceMap := netmap.IPServiceMappings{
+					serviceIPv6: "svc:test-service",
+				}
+				i.lb.SetIPServiceMappingsForTest(IPServiceMap)
+
+				i.atomicIsVIPServiceIPFunc.Store(func(addr netip.Addr) bool {
+					return addr == serviceIPv6
+				})
+
+				i.atomicIsLocalIPFunc.Store(looksLikeATailscaleSelfAddress)
+			},
+			want: false,
+		},
+		{
+			name: "tcp-on-service-vip-with-udp-listener",
+			pkt: &packet.Parsed{
+				IPVersion: 4,
+				IPProto:   ipproto.TCP,
+				Src:       netip.MustParseAddrPort("100.101.102.103:1234"),
+				Dst:       netip.MustParseAddrPort("100.100.100.100:8080"), // serviceIP
+				TCPFlags:  packet.TCPSyn,
+			},
+			beforeStart: func(i *Impl) {
+				i.ProcessLocalIPs = false
+				i.ProcessSubnets = false
+			},
+			afterStart: func(i *Impl) {
+				IPServiceMap := netmap.IPServiceMappings{
+					serviceIP: "svc:test-service",
+				}
+				i.lb.SetIPServiceMappingsForTest(IPServiceMap)
+
+				i.atomicIsVIPServiceIPFunc.Store(func(addr netip.Addr) bool {
+					return addr == serviceIP
+				})
+
+				protocolAddr := tcpip.ProtocolAddress{
+					Protocol:          header.IPv4ProtocolNumber,
+					AddressWithPrefix: tcpip.AddrFrom4(serviceIP.As4()).WithPrefix(),
+				}
+				if err := i.ipstack.AddProtocolAddress(nicID, protocolAddr, stack.AddressProperties{}); err != nil {
+					t.Fatalf("AddProtocolAddress: %v", err)
+				}
+
+				pc, err := gonet.DialUDP(i.ipstack, &tcpip.FullAddress{
+					NIC:  nicID,
+					Addr: tcpip.AddrFrom4(serviceIP.As4()),
+					Port: 8080,
+				}, nil, header.IPv4ProtocolNumber)
+				if err != nil {
+					t.Fatalf("DialUDP: %v", err)
+				}
+				t.Cleanup(func() { pc.Close() })
+
+				i.atomicIsLocalIPFunc.Store(looksLikeATailscaleSelfAddress)
+			},
+			want: false,
+		},
 
 		// TODO(andrew): test PeerAPI
 		// TODO(andrew): test TCP packets without the SYN flag set
@@ -620,11 +812,15 @@ func TestTCPForwardLimits(t *testing.T) {
 // TestTCPForwardLimits_PerClient verifies that the per-client limit for TCP
 // forwarding works.
 func TestTCPForwardLimits_PerClient(t *testing.T) {
+	clientmetric.ResetForTest(t)
+	tstest.AssertNotParallel(t) // calls envknob.Setenv
 	envknob.Setenv("TS_DEBUG_NETSTACK", "true")
 
 	// Set our test override limits during this test.
-	tstest.Replace(t, &maxInFlightConnectionAttemptsForTest, 2)
-	tstest.Replace(t, &maxInFlightConnectionAttemptsPerClientForTest, 1)
+	maxInFlightConnectionAttemptsForTest.Store(2)
+	t.Cleanup(func() { maxInFlightConnectionAttemptsForTest.Store(0) })
+	maxInFlightConnectionAttemptsPerClientForTest.Store(1)
+	t.Cleanup(func() { maxInFlightConnectionAttemptsPerClientForTest.Store(0) })
 
 	impl := makeNetstack(t, func(impl *Impl) {
 		impl.ProcessSubnets = true
@@ -741,15 +937,23 @@ func TestHandleLocalPackets(t *testing.T) {
 		// fd7a:115c:a1e0:b1a:0:7:a01:100/120
 		netip.MustParsePrefix("fd7a:115c:a1e0:b1a:0:7:a01:100/120"),
 	}
+	prefs.AdvertiseServices = []string{"svc:test-service"}
 	_, err := impl.lb.EditPrefs(&ipn.MaskedPrefs{
-		Prefs:              *prefs,
-		AdvertiseRoutesSet: true,
+		Prefs:                *prefs,
+		AdvertiseRoutesSet:   true,
+		AdvertiseServicesSet: true,
 	})
 	if err != nil {
 		t.Fatalf("EditPrefs: %v", err)
 	}
+	IPServiceMap := netmap.IPServiceMappings{
+		netip.MustParseAddr("100.99.55.111"):        "svc:test-service",
+		netip.MustParseAddr("fd7a:115c:a1e0::abcd"): "svc:test-service",
+	}
+	impl.lb.SetIPServiceMappingsForTest(IPServiceMap)
 
 	t.Run("ShouldHandleServiceIP", func(t *testing.T) {
+		t.Parallel()
 		pkt := &packet.Parsed{
 			IPVersion: 4,
 			IPProto:   ipproto.TCP,
@@ -762,7 +966,94 @@ func TestHandleLocalPackets(t *testing.T) {
 			t.Errorf("got filter outcome %v, want filter.DropSilently", resp)
 		}
 	})
+	// Any port on the quad-100 service IP must be absorbed locally by
+	// netstack and never leak out to the WireGuard / peer-routing
+	// layers. Historically we only intercepted specific ports (UDP 53
+	// and TCP 53/80/8080), causing stray traffic to other ports such
+	// as 100.100.100.100:853 (DoT) to time out in wireguard-go and
+	// produce "open-conn-track: timeout opening ...; no associated
+	// peer node" log spam. See the handleLocalPackets comment.
+	quad100LeakCases := []struct {
+		name  string
+		proto ipproto.Proto
+		dst   string
+	}{
+		{"TCP-853-DoT-v4", ipproto.TCP, "100.100.100.100:853"},
+		{"TCP-443-DoH-v4", ipproto.TCP, "100.100.100.100:443"},
+		{"TCP-9000-stray-v4", ipproto.TCP, "100.100.100.100:9000"},
+		{"UDP-853-DoQ-v4", ipproto.UDP, "100.100.100.100:853"},
+		{"UDP-443-v4", ipproto.UDP, "100.100.100.100:443"},
+		{"TCP-853-DoT-v6", ipproto.TCP, "[fd7a:115c:a1e0::53]:853"},
+		{"UDP-443-v6", ipproto.UDP, "[fd7a:115c:a1e0::53]:443"},
+	}
+	for _, tc := range quad100LeakCases {
+		t.Run("ShouldNotLeakQuad100_"+tc.name, func(t *testing.T) {
+			t.Parallel()
+			dst := netip.MustParseAddrPort(tc.dst)
+			ipVersion := uint8(4)
+			if dst.Addr().Is6() {
+				ipVersion = 6
+			}
+			src := "127.0.0.1:9999"
+			if ipVersion == 6 {
+				src = "[::1]:9999"
+			}
+			pkt := &packet.Parsed{
+				IPVersion: ipVersion,
+				IPProto:   tc.proto,
+				Src:       netip.MustParseAddrPort(src),
+				Dst:       dst,
+			}
+			if tc.proto == ipproto.TCP {
+				pkt.TCPFlags = packet.TCPSyn
+			}
+			resp, _ := impl.handleLocalPackets(pkt, impl.tundev, nil)
+			if resp != filter.DropSilently {
+				t.Errorf("quad-100 %s packet leaked: got filter outcome %v, want filter.DropSilently", tc.name, resp)
+			}
+		})
+	}
+	// Exhaustive sweep of all ports for both transport protocols and
+	// both IP versions, confirming no port leaks. The quad-100 branch
+	// of handleLocalPackets is port-independent by construction; this
+	// test serves as a regression guard against accidental port-based
+	// exemptions slipping back in.
+	t.Run("ShouldNotLeakQuad100_AllPorts", func(t *testing.T) {
+		t.Parallel()
+		protos := []ipproto.Proto{ipproto.TCP, ipproto.UDP}
+		dsts := []netip.Addr{
+			netip.MustParseAddr("100.100.100.100"),
+			netip.MustParseAddr("fd7a:115c:a1e0::53"),
+		}
+		for _, proto := range protos {
+			for _, dstAddr := range dsts {
+				ipVersion := uint8(4)
+				srcStr := "127.0.0.1:9999"
+				if dstAddr.Is6() {
+					ipVersion = 6
+					srcStr = "[::1]:9999"
+				}
+				src := netip.MustParseAddrPort(srcStr)
+				for port := 1; port <= 65535; port++ {
+					pkt := &packet.Parsed{
+						IPVersion: ipVersion,
+						IPProto:   proto,
+						Src:       src,
+						Dst:       netip.AddrPortFrom(dstAddr, uint16(port)),
+					}
+					if proto == ipproto.TCP {
+						pkt.TCPFlags = packet.TCPSyn
+					}
+					resp, _ := impl.handleLocalPackets(pkt, impl.tundev, nil)
+					if resp != filter.DropSilently {
+						t.Fatalf("port=%d proto=%v dst=%v: got %v, want filter.DropSilently", port, proto, dstAddr, resp)
+					}
+				}
+			}
+		}
+	})
 	t.Run("ShouldHandle4via6", func(t *testing.T) {
+		t.Parallel()
 		pkt := &packet.Parsed{
 			IPVersion: 6,
 			IPProto:   ipproto.TCP,
@@ -784,7 +1075,22 @@ func TestHandleLocalPackets(t *testing.T) {
 			t.Errorf("got filter outcome %v, want filter.DropSilently", resp)
 		}
 	})
+	t.Run("ShouldHandleLocalTailscaleServices", func(t *testing.T) {
+		t.Parallel()
+		pkt := &packet.Parsed{
+			IPVersion: 4,
+			IPProto:   ipproto.TCP,
+			Src:       netip.MustParseAddrPort("127.0.0.1:9999"),
+			Dst:       netip.MustParseAddrPort("100.99.55.111:80"),
+			TCPFlags:  packet.TCPSyn,
+		}
+		resp, _ := impl.handleLocalPackets(pkt, impl.tundev, nil)
+		if resp != filter.DropSilently {
+			t.Errorf("got filter outcome %v, want filter.DropSilently", resp)
+		}
+	})
 	t.Run("OtherNonHandled", func(t *testing.T) {
+		t.Parallel()
 		pkt := &packet.Parsed{
 			IPVersion: 6,
 			IPProto:   ipproto.TCP,
@@ -807,10 +1113,106 @@ func TestHandleLocalPackets(t *testing.T) {
 	})
 }
 
+// TestQuad100UnservedTCPPortDoesNotForward verifies that a TCP SYN to the
+// Tailscale service IP (100.100.100.100) on a port we don't serve is
+// absorbed by netstack and rejected cleanly, without triggering the
+// outbound forwardTCP dialer.
+//
+// handleLocalPackets now absorbs all quad-100 traffic regardless of
+// port to prevent it leaking to WireGuard peers (which produced noisy
+// "open-conn-track: timeout opening ...; no associated peer node" log
+// lines). That leaves acceptTCP responsible for rejecting connections
+// to ports we don't handle; without an explicit guard, execution would
+// fall through to the isTailscaleIP case (quad-100 is in the tailscale
+// range), rewriting the dial target to 127.0.0.1:<port> and forwarding
+// the connection to whatever random service happened to be listening
+// on the host's loopback at that port.
+//
+// This test asserts that the forward dialer is NOT invoked for quad-100
+// SYNs on unserved ports; the guard in acceptTCP must RST instead.
+func TestQuad100UnservedTCPPortDoesNotForward(t *testing.T) {
+	impl := makeNetstack(t, func(impl *Impl) {
+		impl.ProcessSubnets = false
+		impl.ProcessLocalIPs = false
+		impl.atomicIsLocalIPFunc.Store(looksLikeATailscaleSelfAddress)
+	})
+
+	dialFn, gotConn := makeHangDialer(t)
+	impl.forwardDialFunc = dialFn
+
+	// Use a client IP in the CGNAT range so shouldProcessInbound-adjacent
+	// code paths treat this as plausibly-peer-sourced traffic, matching
+	// what a real stray quad-100 probe from the host OS would look like.
+	client := netip.MustParseAddr("100.101.102.103")
+	quad100 := tsaddr.TailscaleServiceIP()
+
+	// 853 is DoT, the specific case called out in the original bug
+	// report ("conntrack error no peer found for 100.100.100.100:853").
+	// Before the fix, port 853 (and any non-{53,80,8080} port) leaked
+	// out to WireGuard; after the fix it is absorbed here and must NOT
+	// trigger forwardTCP.
+	pkt := tcp4syn(t, client, quad100, 1234, 853)
+	var parsed packet.Parsed
+	parsed.Decode(pkt)
+
+	resp, _ := impl.handleLocalPackets(&parsed, impl.tundev, nil)
+	if resp != filter.DropSilently {
+		t.Fatalf("handleLocalPackets for quad-100:853: got %v, want filter.DropSilently", resp)
+	}
+
+	// acceptTCP runs asynchronously in the gVisor TCP dispatcher after
+	// handleLocalPackets injects the packet into netstack. Use the
+	// in-flight connection counter as a deterministic synchronization
+	// point: wrapTCPProtocolHandler increments connsInFlightByClient
+	// when the dispatcher hands the connection off to acceptTCP, and
+	// acceptTCP's deferred decrementInFlightTCPForward decrements it
+	// on return.
+	//
+	// On the green path (RST guard fires), acceptTCP returns promptly
+	// and the counter reaches 0. On the red path (fall-through to
+	// forwardTCP), acceptTCP blocks inside the forwardDialFunc call —
+	// makeHangDialer signals gotConn on entry (buffered, non-blocking)
+	// and then blocks forever — so the counter never reaches 0 but
+	// gotConn fires synchronously from the dispatcher goroutine. A
+	// select on both races those outcomes without real-time padding.
+	//
+	// testing/synctest is not usable here: gVisor's sleep package calls
+	// the runtime's gopark directly rather than via the standard
+	// library, so synctest.Wait() cannot observe those goroutines
+	// becoming durably blocked and hangs indefinitely.
+	inFlightZero := make(chan struct{})
+	go func() {
+		for {
+			impl.mu.Lock()
+			n := impl.connsInFlightByClient[client]
+			impl.mu.Unlock()
+			if n == 0 {
+				close(inFlightZero)
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	select {
+	case <-gotConn:
+		t.Fatalf("forwardDialFunc was called for quad-100:853; acceptTCP fell through to forwardTCP instead of sending RST. This means stray traffic to quad-100 on unserved ports is being redirected to the host's loopback at the same port.")
+	case <-inFlightZero:
+		// acceptTCP returned cleanly; the RST guard fired.
+	case <-time.After(5 * time.Second):
+		// Safety net so a regression in the in-flight counter plumbing
+		// doesn't hang the whole test run; both outcomes above should
+		// fire within milliseconds in practice.
+		t.Fatal("timed out waiting for acceptTCP to dispatch quad-100:853 SYN")
+	}
+}
+
 func TestShouldSendToHost(t *testing.T) {
 	var (
-		selfIP4 = netip.MustParseAddr("100.64.1.2")
-		selfIP6 = netip.MustParseAddr("fd7a:115c:a1e0::123")
+		selfIP4             = netip.MustParseAddr("100.64.1.2")
+		selfIP6             = netip.MustParseAddr("fd7a:115c:a1e0::123")
+		tailscaleServiceIP4 = netip.MustParseAddr("100.99.55.111")
+		tailscaleServiceIP6 = netip.MustParseAddr("fd7a:115c:a1e0::abcd")
 	)
 
 	makeTestNetstack := func(tb testing.TB) *Impl {
@@ -819,6 +1221,9 @@ func TestShouldSendToHost(t *testing.T) {
 			impl.ProcessLocalIPs = false
 			impl.atomicIsLocalIPFunc.Store(func(addr netip.Addr) bool {
 				return addr == selfIP4 || addr == selfIP6
+			})
+			impl.atomicIsVIPServiceIPFunc.Store(func(addr netip.Addr) bool {
+				return addr == tailscaleServiceIP4 || addr == tailscaleServiceIP6
 			})
 		})
 
@@ -917,6 +1322,33 @@ func TestShouldSendToHost(t *testing.T) {
 			// fd7a:115c:a1e0:b1a:0:7:a01:163/120
 			src:  netip.MustParseAddrPort("[fd7a:115c:a1e0:b1a:0:115c:a01:158]:12345"),
 			dst:  netip.MustParseAddrPort("[fd7a:115:a1e0::99]:7777"),
+			want: false,
+		},
+		// After accessing the Tailscale service from host, replies from Tailscale Service IPs
+		// to the local Tailscale IPs should be sent to the host.
+		{
+			name: "from_service_ip_to_local_ip",
+			src:  netip.AddrPortFrom(tailscaleServiceIP4, 80),
+			dst:  netip.AddrPortFrom(selfIP4, 12345),
+			want: true,
+		},
+		{
+			name: "from_service_ip_to_local_ip_v6",
+			src:  netip.AddrPortFrom(tailscaleServiceIP6, 80),
+			dst:  netip.AddrPortFrom(selfIP6, 12345),
+			want: true,
+		},
+		// Traffic from remote IPs to Tailscale Service IPs should be sent over WireGuard.
+		{
+			name: "from_service_ip_to_remote",
+			src:  netip.AddrPortFrom(tailscaleServiceIP4, 80),
+			dst:  netip.MustParseAddrPort("173.201.32.56:54321"),
+			want: false,
+		},
+		{
+			name: "from_service_ip_to_remote_v6",
+			src:  netip.AddrPortFrom(tailscaleServiceIP6, 80),
+			dst:  netip.MustParseAddrPort("[2001:4860:4860::8888]:54321"),
 			want: false,
 		},
 	}
@@ -1018,4 +1450,296 @@ func makeUDP6PacketBuffer(src, dst netip.AddrPort) *stack.PacketBuffer {
 	udp.SetChecksum(^udp.CalculateChecksum(xsum))
 
 	return pkt
+}
+
+// TestIsSelfDst verifies that isSelfDst correctly identifies packets whose
+// destination IP is a local Tailscale IP assigned to this node.
+func TestIsSelfDst(t *testing.T) {
+	var (
+		selfIP4   = netip.MustParseAddr("100.64.1.2")
+		selfIP6   = netip.MustParseAddr("fd7a:115c:a1e0::123")
+		remoteIP4 = netip.MustParseAddr("100.64.99.88")
+		remoteIP6 = netip.MustParseAddr("fd7a:115c:a1e0::99")
+	)
+
+	ns := makeNetstack(t, func(impl *Impl) {
+		impl.ProcessLocalIPs = true
+		impl.atomicIsLocalIPFunc.Store(func(addr netip.Addr) bool {
+			return addr == selfIP4 || addr == selfIP6
+		})
+	})
+
+	testCases := []struct {
+		name     string
+		src, dst netip.AddrPort
+		want     bool
+	}{
+		{
+			name: "self_to_self_v4",
+			src:  netip.AddrPortFrom(selfIP4, 12345),
+			dst:  netip.AddrPortFrom(selfIP4, 8081),
+			want: true,
+		},
+		{
+			name: "self_to_self_v6",
+			src:  netip.AddrPortFrom(selfIP6, 12345),
+			dst:  netip.AddrPortFrom(selfIP6, 8081),
+			want: true,
+		},
+		{
+			name: "remote_to_self_v4",
+			src:  netip.AddrPortFrom(remoteIP4, 12345),
+			dst:  netip.AddrPortFrom(selfIP4, 8081),
+			want: true,
+		},
+		{
+			name: "remote_to_self_v6",
+			src:  netip.AddrPortFrom(remoteIP6, 12345),
+			dst:  netip.AddrPortFrom(selfIP6, 8081),
+			want: true,
+		},
+		{
+			name: "self_to_remote_v4",
+			src:  netip.AddrPortFrom(selfIP4, 12345),
+			dst:  netip.AddrPortFrom(remoteIP4, 8081),
+			want: false,
+		},
+		{
+			name: "self_to_remote_v6",
+			src:  netip.AddrPortFrom(selfIP6, 12345),
+			dst:  netip.AddrPortFrom(remoteIP6, 8081),
+			want: false,
+		},
+		{
+			name: "remote_to_remote_v4",
+			src:  netip.AddrPortFrom(remoteIP4, 12345),
+			dst:  netip.MustParseAddrPort("100.64.77.66:7777"),
+			want: false,
+		},
+		{
+			name: "service_ip_to_self_v4",
+			src:  netip.AddrPortFrom(serviceIP, 53),
+			dst:  netip.AddrPortFrom(selfIP4, 9999),
+			want: true,
+		},
+		{
+			name: "service_ip_to_self_v6",
+			src:  netip.AddrPortFrom(serviceIPv6, 53),
+			dst:  netip.AddrPortFrom(selfIP6, 9999),
+			want: true,
+		},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			var pkt *stack.PacketBuffer
+			if tt.src.Addr().Is4() {
+				pkt = makeUDP4PacketBuffer(tt.src, tt.dst)
+			} else {
+				pkt = makeUDP6PacketBuffer(tt.src, tt.dst)
+			}
+			defer pkt.DecRef()
+
+			if got := ns.isSelfDst(pkt); got != tt.want {
+				t.Errorf("isSelfDst(%v -> %v) = %v, want %v", tt.src, tt.dst, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestDeliverLoopback verifies that DeliverLoopback correctly re-serializes an
+// outbound packet and delivers it back into gVisor's inbound path.
+func TestDeliverLoopback(t *testing.T) {
+	ep := newLinkEndpoint(64, 1280, "", groNotSupported)
+
+	// Track delivered packets via a mock dispatcher.
+	type delivered struct {
+		proto tcpip.NetworkProtocolNumber
+		data  []byte
+	}
+	deliveredCh := make(chan delivered, 4)
+	ep.Attach(&mockDispatcher{
+		onDeliverNetworkPacket: func(proto tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+			// Capture the raw bytes from the delivered packet. At this
+			// point the packet is unparsed — everything is in the
+			// payload, no headers have been consumed yet.
+			buf := pkt.ToBuffer()
+			raw := buf.Flatten()
+			deliveredCh <- delivered{proto: proto, data: raw}
+		},
+	})
+
+	t.Run("ipv4", func(t *testing.T) {
+		selfAddr := netip.MustParseAddrPort("100.64.1.2:8081")
+		pkt := makeUDP4PacketBuffer(selfAddr, selfAddr)
+		// Capture what the outbound bytes look like before loopback.
+		wantLen := pkt.Size()
+		wantProto := pkt.NetworkProtocolNumber
+
+		if !ep.DeliverLoopback(pkt) {
+			t.Fatal("DeliverLoopback returned false")
+		}
+
+		select {
+		case got := <-deliveredCh:
+			if got.proto != wantProto {
+				t.Errorf("proto = %d, want %d", got.proto, wantProto)
+			}
+			if len(got.data) != wantLen {
+				t.Errorf("data length = %d, want %d", len(got.data), wantLen)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timeout waiting for loopback delivery")
+		}
+	})
+
+	t.Run("ipv6", func(t *testing.T) {
+		selfAddr := netip.MustParseAddrPort("[fd7a:115c:a1e0::123]:8081")
+		pkt := makeUDP6PacketBuffer(selfAddr, selfAddr)
+		wantLen := pkt.Size()
+		wantProto := pkt.NetworkProtocolNumber
+
+		if !ep.DeliverLoopback(pkt) {
+			t.Fatal("DeliverLoopback returned false")
+		}
+
+		select {
+		case got := <-deliveredCh:
+			if got.proto != wantProto {
+				t.Errorf("proto = %d, want %d", got.proto, wantProto)
+			}
+			if len(got.data) != wantLen {
+				t.Errorf("data length = %d, want %d", len(got.data), wantLen)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timeout waiting for loopback delivery")
+		}
+	})
+
+	t.Run("nil_dispatcher", func(t *testing.T) {
+		ep2 := newLinkEndpoint(64, 1280, "", groNotSupported)
+		// Don't attach a dispatcher.
+		selfAddr := netip.MustParseAddrPort("100.64.1.2:8081")
+		pkt := makeUDP4PacketBuffer(selfAddr, selfAddr)
+		if ep2.DeliverLoopback(pkt) {
+			t.Error("DeliverLoopback should return false with nil dispatcher")
+		}
+		// pkt refcount was consumed by DeliverLoopback, so we don't DecRef.
+	})
+}
+
+// mockDispatcher implements stack.NetworkDispatcher for testing.
+type mockDispatcher struct {
+	onDeliverNetworkPacket func(tcpip.NetworkProtocolNumber, *stack.PacketBuffer)
+}
+
+func (d *mockDispatcher) DeliverNetworkPacket(proto tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+	if d.onDeliverNetworkPacket != nil {
+		d.onDeliverNetworkPacket(proto, pkt)
+	}
+}
+
+func (d *mockDispatcher) DeliverLinkPacket(tcpip.NetworkProtocolNumber, *stack.PacketBuffer) {}
+
+// udp4raw constructs a valid raw IPv4+UDP packet with proper checksums.
+func udp4raw(t testing.TB, src, dst netip.Addr, sport, dport uint16, payload []byte) []byte {
+	t.Helper()
+	totalLen := header.IPv4MinimumSize + header.UDPMinimumSize + len(payload)
+	buf := make([]byte, totalLen)
+
+	ip := header.IPv4(buf)
+	ip.Encode(&header.IPv4Fields{
+		TotalLength: uint16(totalLen),
+		Protocol:    uint8(header.UDPProtocolNumber),
+		TTL:         64,
+		SrcAddr:     tcpip.AddrFrom4Slice(src.AsSlice()),
+		DstAddr:     tcpip.AddrFrom4Slice(dst.AsSlice()),
+	})
+	ip.SetChecksum(^ip.CalculateChecksum())
+
+	// Build UDP header + payload.
+	u := header.UDP(buf[header.IPv4MinimumSize:])
+	u.Encode(&header.UDPFields{
+		SrcPort: sport,
+		DstPort: dport,
+		Length:  uint16(header.UDPMinimumSize + len(payload)),
+	})
+	copy(buf[header.IPv4MinimumSize+header.UDPMinimumSize:], payload)
+
+	xsum := header.PseudoHeaderChecksum(
+		header.UDPProtocolNumber,
+		tcpip.AddrFrom4Slice(src.AsSlice()),
+		tcpip.AddrFrom4Slice(dst.AsSlice()),
+		uint16(header.UDPMinimumSize+len(payload)),
+	)
+	u.SetChecksum(^header.UDP(buf[header.IPv4MinimumSize:]).CalculateChecksum(xsum))
+	return buf
+}
+
+// TestInjectLoopback verifies that the inject goroutine delivers self-addressed
+// packets back into gVisor (via DeliverLoopback) instead of sending them to
+// WireGuard outbound. This is a regression test for a bug where self-dial
+// packets were sent to WireGuard and silently dropped.
+func TestInjectLoopback(t *testing.T) {
+	selfIP4 := netip.MustParseAddr("100.64.1.2")
+
+	ns := makeNetstack(t, func(impl *Impl) {
+		impl.ProcessLocalIPs = true
+		impl.atomicIsLocalIPFunc.Store(func(addr netip.Addr) bool {
+			return addr == selfIP4
+		})
+	})
+
+	// Register gVisor's NIC address so the stack accepts and routes
+	// packets for this IP.
+	protocolAddr := tcpip.ProtocolAddress{
+		Protocol:          header.IPv4ProtocolNumber,
+		AddressWithPrefix: tcpip.AddrFrom4(selfIP4.As4()).WithPrefix(),
+	}
+	if err := ns.ipstack.AddProtocolAddress(nicID, protocolAddr, stack.AddressProperties{}); err != nil {
+		t.Fatalf("AddProtocolAddress: %v", err)
+	}
+
+	// Bind a UDP socket on the gVisor stack to receive the loopback packet.
+	pc, err := gonet.DialUDP(ns.ipstack, &tcpip.FullAddress{
+		NIC:  nicID,
+		Addr: tcpip.AddrFrom4(selfIP4.As4()),
+		Port: 8081,
+	}, nil, header.IPv4ProtocolNumber)
+	if err != nil {
+		t.Fatalf("DialUDP: %v", err)
+	}
+	defer pc.Close()
+
+	// Build a valid self-addressed UDP packet from raw bytes and wrap it
+	// in a gVisor PacketBuffer with headers already pushed, as gVisor's
+	// outbound path produces.
+	payload := []byte("loopback test")
+	raw := udp4raw(t, selfIP4, selfIP4, 12345, 8081, payload)
+
+	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		ReserveHeaderBytes: header.IPv4MinimumSize + header.UDPMinimumSize,
+		Payload:            buffer.MakeWithData(payload),
+	})
+	copy(pkt.TransportHeader().Push(header.UDPMinimumSize),
+		raw[header.IPv4MinimumSize:header.IPv4MinimumSize+header.UDPMinimumSize])
+	pkt.TransportProtocolNumber = header.UDPProtocolNumber
+	copy(pkt.NetworkHeader().Push(header.IPv4MinimumSize), raw[:header.IPv4MinimumSize])
+	pkt.NetworkProtocolNumber = header.IPv4ProtocolNumber
+
+	if err := ns.linkEP.q.Write(pkt); err != nil {
+		t.Fatalf("queue.Write: %v", err)
+	}
+
+	// The inject goroutine should detect the self-addressed packet via
+	// isSelfDst and deliver it back into gVisor via DeliverLoopback.
+	pc.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 256)
+	n, _, err := pc.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("ReadFrom: %v (self-addressed packet was not looped back)", err)
+	}
+	if got := string(buf[:n]); got != "loopback test" {
+		t.Errorf("got %q, want %q", got, "loopback test")
+	}
 }

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // The sniproxy is an outbound SNI proxy. It receives TLS connections over
@@ -141,7 +141,7 @@ func run(ctx context.Context, ts *tsnet.Server, wgPort int, hostname string, pro
 	// in the netmap.
 	// We set the NotifyInitialNetMap flag so we will always get woken with the
 	// current netmap, before only being woken on changes.
-	bus, err := lc.WatchIPNBus(ctx, ipn.NotifyWatchEngineUpdates|ipn.NotifyInitialNetMap|ipn.NotifyNoPrivateKeys)
+	bus, err := lc.WatchIPNBus(ctx, ipn.NotifyWatchEngineUpdates|ipn.NotifyInitialNetMap)
 	if err != nil {
 		log.Fatalf("watching IPN bus: %v", err)
 	}
@@ -225,7 +225,7 @@ func (s *sniproxy) mergeConfigFromFlags(out *appctype.AppConnectorConfig, ports,
 		Addrs: []netip.Addr{ip4, ip6},
 	}
 	if ports != "" {
-		for _, portStr := range strings.Split(ports, ",") {
+		for portStr := range strings.SplitSeq(ports, ",") {
 			port, err := strconv.ParseUint(portStr, 10, 16)
 			if err != nil {
 				log.Fatalf("invalid port: %s", portStr)
@@ -238,7 +238,7 @@ func (s *sniproxy) mergeConfigFromFlags(out *appctype.AppConnectorConfig, ports,
 	}
 
 	var forwardConfigFromFlags []appctype.DNATConfig
-	for _, forwStr := range strings.Split(forwards, ",") {
+	for forwStr := range strings.SplitSeq(forwards, ",") {
 		if forwStr == "" {
 			continue
 		}

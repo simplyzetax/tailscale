@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package opt defines optional types.
@@ -80,6 +80,17 @@ func (b *Bool) Scan(src any) error {
 		return nil
 	default:
 		return fmt.Errorf("opt.Bool.Scan: invalid type %T: %v", src, src)
+	}
+}
+
+// Normalized returns the normalized form of b, mapping "unset" to ""
+// and leaving other values unchanged.
+func (b Bool) Normalized() Bool {
+	switch b {
+	case ExplicitlyUnset:
+		return Empty
+	default:
+		return b
 	}
 }
 

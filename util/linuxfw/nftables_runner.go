@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux
@@ -20,7 +20,6 @@ import (
 	"golang.org/x/sys/unix"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/types/logger"
-	"tailscale.com/types/ptr"
 )
 
 const (
@@ -454,8 +453,13 @@ func getOrCreateChain(c *nftables.Conn, cinfo chainInfo) (*nftables.Chain, error
 		// type/hook/priority, but for "conventional chains" assume they're what
 		// we expect (in case iptables-nft/ufw make minor behavior changes in
 		// the future).
-		if isTSChain(chain.Name) && (chain.Type != cinfo.chainType || *chain.Hooknum != *cinfo.chainHook || *chain.Priority != *cinfo.chainPriority) {
-			return nil, fmt.Errorf("chain %s already exists with different type/hook/priority", cinfo.name)
+		if isTSChain(chain.Name) {
+			if chain.Hooknum == nil || chain.Priority == nil {
+				return nil, errors.New("nftables chain has nil hooknum or priority; kernel may lack nftables support (CONFIG_NF_TABLES)")
+			}
+			if chain.Type != cinfo.chainType || *chain.Hooknum != *cinfo.chainHook || *chain.Priority != *cinfo.chainPriority {
+				return nil, fmt.Errorf("chain %s already exists with different type/hook/priority", cinfo.name)
+			}
 		}
 		return chain, nil
 	}
@@ -521,6 +525,15 @@ type NetfilterRunner interface {
 	// using conntrack.
 	DelStatefulRule(tunname string) error
 
+	// AddConnmarkSaveRule adds conntrack marking rules to save marks from packets.
+	// These rules run in mangle/PREROUTING and mangle/OUTPUT to mark connections
+	// and restore marks on reply packets before rp_filter checks, enabling proper
+	// routing table lookups for exit nodes and subnet routers.
+	AddConnmarkSaveRule() error
+
+	// DelConnmarkSaveRule removes conntrack marking rules added by AddConnmarkSaveRule.
+	DelConnmarkSaveRule() error
+
 	// HasIPV6 reports true if the system supports IPv6.
 	HasIPV6() bool
 
@@ -580,6 +593,15 @@ type NetfilterRunner interface {
 	// DelMagicsockPortRule removes the rule created by AddMagicsockPortRule,
 	// if it exists.
 	DelMagicsockPortRule(port uint16, network string) error
+
+	// AddExternalCGNATRules adds rules to the ts-input chain to deal with
+	// traffic from the CGNAT range that arrives on non-Tailscale network
+	// interfaces.
+	AddExternalCGNATRules(mode CGNATMode, tunname string) error
+
+	// DelExternalCGNATRules removes the rules created by AddExternalCGNATRules,
+	// if they exist.
+	DelExternalCGNATRules(mode CGNATMode, tunname string) error
 }
 
 // New creates a NetfilterRunner, auto-detecting whether to use
@@ -946,7 +968,7 @@ const (
 // via netfilter via nftables, as a last resort measure to detect that nftables
 // can be used. It cleans up the dummy chains after creation.
 func (n *nftablesRunner) createDummyPostroutingChains() (retErr error) {
-	polAccept := ptr.To(nftables.ChainPolicyAccept)
+	polAccept := new(nftables.ChainPolicyAccept)
 	for _, table := range n.getTables() {
 		nat, err := createTableIfNotExist(n.conn, table.Proto, tsDummyTableName)
 		if err != nil {
@@ -1208,6 +1230,27 @@ func addReturnChromeOSVMRangeRule(c *nftables.Conn, table *nftables.Table, chain
 	return nil
 }
 
+// delReturnChromeOSVMRangeRule deletes the rule created by addReturnChromeOSVMRangeRule,
+// if it exists.
+func delReturnChromeOSVMRangeRule(c *nftables.Conn, table *nftables.Table, chain *nftables.Chain, tunname string) error {
+	rule, err := createRangeRule(table, chain, tunname, tsaddr.ChromeOSVMRange(), expr.VerdictReturn)
+	if err != nil {
+		return fmt.Errorf("create rule: %w", err)
+	}
+	rule, err = findRule(c, rule)
+	if err != nil {
+		return fmt.Errorf("find rule: %v", err)
+	}
+	if rule == nil {
+		return nil
+	}
+	_ = c.DelRule(rule)
+	if err := c.Flush(); err != nil {
+		return fmt.Errorf("flush del rule: %w", err)
+	}
+	return nil
+}
+
 // addDropCGNATRangeRule adds a rule to drop if the source IP is in the
 // CGNAT range.
 func addDropCGNATRangeRule(c *nftables.Conn, table *nftables.Table, chain *nftables.Chain, tunname string) error {
@@ -1218,6 +1261,62 @@ func addDropCGNATRangeRule(c *nftables.Conn, table *nftables.Table, chain *nftab
 	_ = c.AddRule(rule)
 	if err = c.Flush(); err != nil {
 		return fmt.Errorf("add rule: %w", err)
+	}
+	return nil
+}
+
+// delDropCGNATRangeRule deletes the rule created by addDropCGNATRangeRule,
+// if it exists.
+func delDropCGNATRangeRule(c *nftables.Conn, table *nftables.Table, chain *nftables.Chain, tunname string) error {
+	rule, err := createRangeRule(table, chain, tunname, tsaddr.CGNATRange(), expr.VerdictDrop)
+	if err != nil {
+		return fmt.Errorf("create rule: %w", err)
+	}
+	rule, err = findRule(c, rule)
+	if err != nil {
+		return fmt.Errorf("find rule: %v", err)
+	}
+	if rule == nil {
+		return nil
+	}
+	_ = c.DelRule(rule)
+	if err := c.Flush(); err != nil {
+		return fmt.Errorf("flush del rule: %w", err)
+	}
+	return nil
+}
+
+// addReturnCGNATRangeRule adds a rule to return if the source IP is in the
+// CGNAT range.
+func addReturnCGNATRangeRule(c *nftables.Conn, table *nftables.Table, chain *nftables.Chain, tunname string) error {
+	rule, err := createRangeRule(table, chain, tunname, tsaddr.CGNATRange(), expr.VerdictReturn)
+	if err != nil {
+		return fmt.Errorf("create rule: %w", err)
+	}
+	_ = c.AddRule(rule)
+	if err = c.Flush(); err != nil {
+		return fmt.Errorf("add rule: %w", err)
+	}
+	return nil
+}
+
+// delReturnCGNATRangeRule deletes the rule created by addReturnCGNATRangeRule,
+// if it exists.
+func delReturnCGNATRangeRule(c *nftables.Conn, table *nftables.Table, chain *nftables.Chain, tunname string) error {
+	rule, err := createRangeRule(table, chain, tunname, tsaddr.CGNATRange(), expr.VerdictReturn)
+	if err != nil {
+		return fmt.Errorf("create rule: %w", err)
+	}
+	rule, err = findRule(c, rule)
+	if err != nil {
+		return fmt.Errorf("find rule: %v", err)
+	}
+	if rule == nil {
+		return nil
+	}
+	_ = c.DelRule(rule)
+	if err := c.Flush(); err != nil {
+		return fmt.Errorf("flush del rule: %w", err)
 	}
 	return nil
 }
@@ -1489,6 +1588,67 @@ func (n *nftablesRunner) DelMagicsockPortRule(port uint16, network string) error
 	return nil
 }
 
+// AddExternalCGNATRules adds rules to the ts-input chain to deal with
+// traffic from the CGNAT range that arrives on non-Tailscale network
+// interfaces.
+func (n *nftablesRunner) AddExternalCGNATRules(mode CGNATMode, tunname string) error {
+	conn := n.conn
+
+	inputChain, err := getChainFromTable(conn, n.nft4.Filter, chainNameInput)
+	if err != nil {
+		return fmt.Errorf("get input chain v4: %v", err)
+	}
+	switch mode {
+	case CGNATModeDrop:
+		if err = addReturnChromeOSVMRangeRule(conn, n.nft4.Filter, inputChain, tunname); err != nil {
+			return fmt.Errorf("add return chromeos vm range rule v4: %w", err)
+		}
+		if err = addDropCGNATRangeRule(conn, n.nft4.Filter, inputChain, tunname); err != nil {
+			return fmt.Errorf("add drop cgnat range rule v4: %w", err)
+		}
+	case CGNATModeReturn:
+		if err = addReturnCGNATRangeRule(conn, n.nft4.Filter, inputChain, tunname); err != nil {
+			return fmt.Errorf("add return cgnat range rule v4: %w", err)
+		}
+	default:
+		return fmt.Errorf("unsupported cgnat mode %q", mode)
+	}
+	if err = conn.Flush(); err != nil {
+		return fmt.Errorf("flush cgnat rules v4: %w", err)
+	}
+	return nil
+}
+
+// DelExternalCGNATRules removes the rules created by AddExternalCGNATRules,
+// if they exist.
+func (n *nftablesRunner) DelExternalCGNATRules(mode CGNATMode, tunname string) error {
+	conn := n.conn
+
+	inputChain, err := getChainFromTable(conn, n.nft4.Filter, chainNameInput)
+	if err != nil {
+		return fmt.Errorf("get input chain v4: %v", err)
+	}
+	switch mode {
+	case CGNATModeDrop:
+		if err = delReturnChromeOSVMRangeRule(conn, n.nft4.Filter, inputChain, tunname); err != nil {
+			return fmt.Errorf("del return chromeos vm range rule v4: %w", err)
+		}
+		if err = delDropCGNATRangeRule(conn, n.nft4.Filter, inputChain, tunname); err != nil {
+			return fmt.Errorf("del drop cgnat range rule v4: %w", err)
+		}
+	case CGNATModeReturn:
+		if err = delReturnCGNATRangeRule(conn, n.nft4.Filter, inputChain, tunname); err != nil {
+			return fmt.Errorf("del return cgnat range rule v4: %w", err)
+		}
+	default:
+		return fmt.Errorf("unsupported mode %q", mode)
+	}
+	if err = conn.Flush(); err != nil {
+		return fmt.Errorf("flush cgnat rules v4: %w", err)
+	}
+	return nil
+}
+
 // createAcceptIncomingPacketRule creates a rule to accept incoming packets to
 // the given interface.
 func createAcceptIncomingPacketRule(table *nftables.Table, chain *nftables.Chain, tunname string) *nftables.Rule {
@@ -1541,12 +1701,6 @@ func (n *nftablesRunner) addBase4(tunname string) error {
 	inputChain, err := getChainFromTable(conn, n.nft4.Filter, chainNameInput)
 	if err != nil {
 		return fmt.Errorf("get input chain v4: %v", err)
-	}
-	if err = addReturnChromeOSVMRangeRule(conn, n.nft4.Filter, inputChain, tunname); err != nil {
-		return fmt.Errorf("add return chromeos vm range rule v4: %w", err)
-	}
-	if err = addDropCGNATRangeRule(conn, n.nft4.Filter, inputChain, tunname); err != nil {
-		return fmt.Errorf("add drop cgnat range rule v4: %w", err)
 	}
 	if err = addAcceptIncomingPacketRule(conn, n.nft4.Filter, inputChain, tunname); err != nil {
 		return fmt.Errorf("add accept incoming packet rule v4: %w", err)
@@ -1947,6 +2101,242 @@ func (n *nftablesRunner) DelStatefulRule(tunname string) error {
 	if err := conn.Flush(); err != nil {
 		return fmt.Errorf("flush del stateful rule: %w", err)
 	}
+	return nil
+}
+
+// makeConnmarkRestoreExprs creates nftables expressions to restore mark from conntrack.
+// Implements: ct state established,related ct mark & 0xff0000 != 0 meta mark set ct mark & 0xff0000
+func makeConnmarkRestoreExprs() []expr.Any {
+	return []expr.Any{
+		// Load conntrack state into register 1
+		&expr.Ct{
+			Register: 1,
+			Key:      expr.CtKeySTATE,
+		},
+		// Check if state is ESTABLISHED or RELATED
+		&expr.Bitwise{
+			SourceRegister: 1,
+			DestRegister:   1,
+			Len:            4,
+			Mask: nativeUint32(
+				expr.CtStateBitESTABLISHED |
+					expr.CtStateBitRELATED),
+			Xor: nativeUint32(0),
+		},
+		&expr.Cmp{
+			Op:       expr.CmpOpNeq,
+			Register: 1,
+			Data:     []byte{0, 0, 0, 0},
+		},
+		// Load conntrack mark into register 1
+		&expr.Ct{
+			Register: 1,
+			Key:      expr.CtKeyMARK,
+		},
+		// Mask to Tailscale mark bits (0xff0000)
+		&expr.Bitwise{
+			SourceRegister: 1,
+			DestRegister:   1,
+			Len:            4,
+			Mask:           getTailscaleFwmarkMask(),
+			Xor:            []byte{0x00, 0x00, 0x00, 0x00},
+		},
+		// Set packet mark from register 1
+		&expr.Meta{
+			Key:            expr.MetaKeyMARK,
+			SourceRegister: true,
+			Register:       1,
+		},
+	}
+}
+
+// makeConnmarkSaveExprs creates nftables expressions to save mark to conntrack.
+// Implements: ct state new meta mark & 0xff0000 != 0 ct mark set meta mark & 0xff0000
+func makeConnmarkSaveExprs() []expr.Any {
+	return []expr.Any{
+		// Load conntrack state into register 1
+		&expr.Ct{
+			Register: 1,
+			Key:      expr.CtKeySTATE,
+		},
+		// Check if state is NEW
+		&expr.Bitwise{
+			SourceRegister: 1,
+			DestRegister:   1,
+			Len:            4,
+			Mask:           nativeUint32(expr.CtStateBitNEW),
+			Xor:            nativeUint32(0),
+		},
+		&expr.Cmp{
+			Op:       expr.CmpOpNeq,
+			Register: 1,
+			Data:     []byte{0, 0, 0, 0},
+		},
+		// Load packet mark into register 1
+		&expr.Meta{
+			Key:      expr.MetaKeyMARK,
+			Register: 1,
+		},
+		// Mask to Tailscale mark bits (0xff0000)
+		&expr.Bitwise{
+			SourceRegister: 1,
+			DestRegister:   1,
+			Len:            4,
+			Mask:           getTailscaleFwmarkMask(),
+			Xor:            []byte{0x00, 0x00, 0x00, 0x00},
+		},
+		// Check if mark is non-zero
+		&expr.Cmp{
+			Op:       expr.CmpOpNeq,
+			Register: 1,
+			Data:     []byte{0, 0, 0, 0},
+		},
+		// Load packet mark again for saving
+		&expr.Meta{
+			Key:      expr.MetaKeyMARK,
+			Register: 1,
+		},
+		// Mask again
+		&expr.Bitwise{
+			SourceRegister: 1,
+			DestRegister:   1,
+			Len:            4,
+			Mask:           getTailscaleFwmarkMask(),
+			Xor:            []byte{0x00, 0x00, 0x00, 0x00},
+		},
+		// Set conntrack mark from register 1
+		&expr.Ct{
+			Key:            expr.CtKeyMARK,
+			SourceRegister: true,
+			Register:       1,
+		},
+	}
+}
+
+// AddConnmarkSaveRule adds conntrack marking rules to save and restore marks.
+// These rules run in mangle/PREROUTING (to restore marks from conntrack) and
+// mangle/OUTPUT (to save marks to conntrack) before rp_filter checks, enabling
+// proper routing table lookups for exit nodes and subnet routers.
+func (n *nftablesRunner) AddConnmarkSaveRule() error {
+	conn := n.conn
+
+	// Check if rules already exist (idempotency)
+	for _, table := range n.getTables() {
+		mangleTable := &nftables.Table{
+			Family: table.Proto,
+			Name:   "mangle",
+		}
+
+		// Check PREROUTING chain for restore rule
+		preroutingChain, err := getChainFromTable(conn, mangleTable, "PREROUTING")
+		if err == nil {
+			rules, _ := conn.GetRules(preroutingChain.Table, preroutingChain)
+			for _, rule := range rules {
+				if string(rule.UserData) == "ts-connmark-restore" {
+					// Rules already exist, skip adding
+					return nil
+				}
+			}
+		}
+	}
+
+	// Add rules for both IPv4 and IPv6
+	for _, table := range n.getTables() {
+		// Get or create mangle table
+		mangleTable := &nftables.Table{
+			Family: table.Proto,
+			Name:   "mangle",
+		}
+		conn.AddTable(mangleTable)
+
+		// Get or create PREROUTING chain
+		preroutingChain, err := getChainFromTable(conn, mangleTable, "PREROUTING")
+		if err != nil {
+			// Chain doesn't exist, create it
+			preroutingChain = conn.AddChain(&nftables.Chain{
+				Name:     "PREROUTING",
+				Table:    mangleTable,
+				Type:     nftables.ChainTypeFilter,
+				Hooknum:  nftables.ChainHookPrerouting,
+				Priority: nftables.ChainPriorityMangle,
+			})
+		}
+
+		// Add PREROUTING rule to restore mark from conntrack
+		conn.InsertRule(&nftables.Rule{
+			Table:    mangleTable,
+			Chain:    preroutingChain,
+			Exprs:    makeConnmarkRestoreExprs(),
+			UserData: []byte("ts-connmark-restore"),
+		})
+
+		// Get or create OUTPUT chain
+		outputChain, err := getChainFromTable(conn, mangleTable, "OUTPUT")
+		if err != nil {
+			// Chain doesn't exist, create it
+			outputChain = conn.AddChain(&nftables.Chain{
+				Name:     "OUTPUT",
+				Table:    mangleTable,
+				Type:     nftables.ChainTypeFilter,
+				Hooknum:  nftables.ChainHookOutput,
+				Priority: nftables.ChainPriorityMangle,
+			})
+		}
+
+		// Add OUTPUT rule to save mark to conntrack
+		conn.InsertRule(&nftables.Rule{
+			Table:    mangleTable,
+			Chain:    outputChain,
+			Exprs:    makeConnmarkSaveExprs(),
+			UserData: []byte("ts-connmark-save"),
+		})
+	}
+
+	if err := conn.Flush(); err != nil {
+		return fmt.Errorf("flush add connmark rules: %w", err)
+	}
+
+	return nil
+}
+
+// DelConnmarkSaveRule removes conntrack marking rules added by AddConnmarkSaveRule.
+func (n *nftablesRunner) DelConnmarkSaveRule() error {
+	conn := n.conn
+
+	for _, table := range n.getTables() {
+		mangleTable := &nftables.Table{
+			Family: table.Proto,
+			Name:   "mangle",
+		}
+
+		// Remove PREROUTING rule - look for restore-mark rule by UserData
+		preroutingChain, err := getChainFromTable(conn, mangleTable, "PREROUTING")
+		if err == nil {
+			rules, _ := conn.GetRules(preroutingChain.Table, preroutingChain)
+			for _, rule := range rules {
+				if string(rule.UserData) == "ts-connmark-restore" {
+					conn.DelRule(rule)
+					break
+				}
+			}
+		}
+
+		// Remove OUTPUT rule - look for save-mark rule by UserData
+		outputChain, err := getChainFromTable(conn, mangleTable, "OUTPUT")
+		if err == nil {
+			rules, _ := conn.GetRules(outputChain.Table, outputChain)
+			for _, rule := range rules {
+				if string(rule.UserData) == "ts-connmark-save" {
+					conn.DelRule(rule)
+					break
+				}
+			}
+		}
+	}
+
+	// Ignore errors during deletion - rules might not exist
+	conn.Flush()
+
 	return nil
 }
 

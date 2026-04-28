@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !android
@@ -86,8 +86,10 @@ type linuxRouter struct {
 	localRoutes       map[netip.Prefix]bool
 	snatSubnetRoutes  bool
 	statefulFiltering bool
+	connmarkEnabled   bool // whether connmark rules are currently enabled
 	netfilterMode     preftype.NetfilterMode
 	netfilterKind     string
+	cgnatMode         linuxfw.CGNATMode
 	magicsockPortV4   uint16
 	magicsockPortV6   uint16
 }
@@ -370,6 +372,12 @@ func (r *linuxRouter) Close() error {
 		r.unregNetMon()
 	}
 	r.eventClient.Close()
+
+	// Clean up connmark rules
+	if err := r.nfr.DelConnmarkSaveRule(); err != nil {
+		r.logf("warning: failed to delete connmark rules: %v", err)
+	}
+
 	if err := r.downInterface(); err != nil {
 		return err
 	}
@@ -479,13 +487,91 @@ func (r *linuxRouter) Set(cfg *router.Config) error {
 	r.statefulFiltering = cfg.StatefulFiltering
 	r.updateStatefulFilteringWithDockerWarning(cfg)
 
+	// Connmark rules for rp_filter compatibility.
+	// Always enabled when netfilter is ON to handle all rp_filter=1 scenarios
+	// (normal operation, exit nodes, subnet routers, and clients using exit nodes).
+	netfilterOn := cfg.NetfilterMode == netfilterOn
+	switch {
+	case netfilterOn == r.connmarkEnabled:
+		// state already correct, nothing to do.
+	case netfilterOn:
+		r.logf("enabling connmark-based rp_filter workaround")
+		if err := r.nfr.AddConnmarkSaveRule(); err != nil {
+			r.logf("warning: failed to add connmark rules (rp_filter workaround may not work): %v", err)
+			errs = append(errs, fmt.Errorf("enabling connmark rules: %w", err))
+		} else {
+			// Only update state on success to keep it in sync with actual rules
+			r.connmarkEnabled = true
+		}
+		// Enable src_valid_mark so the kernel uses the packet's fwmark
+		// during the rp_filter reverse-path check. Without this, the
+		// connmark restore in mangle/PREROUTING is ineffective — rp_filter
+		// does its routing lookup with fwmark=0, ignoring the restored
+		// bypass mark, and drops reply packets as martians.
+		if err := writeSysctl("net.ipv4.conf.all.src_valid_mark", "1"); err != nil {
+			r.logf("warning: failed to enable src_valid_mark: %v", err)
+		}
+	default:
+		r.logf("disabling connmark-based rp_filter workaround")
+		if err := r.nfr.DelConnmarkSaveRule(); err != nil {
+			// Deletion errors are only logged, not returned, because:
+			// 1. Rules may not exist (e.g., first run or after manual deletion)
+			// 2. Failure to delete is less critical than failure to add
+			// 3. We still want to update state to attempt re-add on next enable
+			r.logf("warning: failed to delete connmark rules: %v", err)
+		}
+		// Always clear state when disabling, even if delete failed
+		r.connmarkEnabled = false
+	}
+
 	// Issue 11405: enable IP forwarding on gokrazy.
 	advertisingRoutes := len(cfg.SubnetRoutes) > 0
 	if getDistroFunc() == distro.Gokrazy && advertisingRoutes {
 		r.enableIPForwarding()
 	}
 
+	// Remove the rule to drop off-tailnet CGNAT traffic, if asked.
+	if netfilterOn || cfg.NetfilterMode == netfilterNoDivert {
+		var cgnatMode linuxfw.CGNATMode
+		if cfg.RemoveCGNATDropRule {
+			cgnatMode = linuxfw.CGNATModeReturn
+		} else {
+			cgnatMode = linuxfw.CGNATModeDrop
+		}
+		err := r.setCGNATDropModeLocked(cgnatMode)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("set cgnat mode: %w", err))
+		}
+	}
+
 	return errors.Join(errs...)
+}
+
+// setCGNATDropModeLocked clears old rules and add new rules for the desired
+// behavior for incoming non-Tailscale CGNAT packets.
+// [linuxRouter.mu] must be held.
+func (r *linuxRouter) setCGNATDropModeLocked(want linuxfw.CGNATMode) error {
+	if want == r.cgnatMode {
+		return nil
+	}
+	// r.cgnatMode is empty at initial startup, before this function has been
+	// called for the first time. In that case, we can skip deleting old
+	// rules, because there aren't any.
+	if r.cgnatMode != "" {
+		err := r.nfr.DelExternalCGNATRules(r.cgnatMode, r.tunname)
+		if err != nil {
+			return fmt.Errorf("clear old cgnat rules: %w", err)
+		}
+	}
+	err := r.nfr.AddExternalCGNATRules(want, r.tunname)
+	if err != nil {
+		// We currently have no rules set, so change the state to reflect that
+		// so we might try again on a future Router update.
+		r.cgnatMode = ""
+		return fmt.Errorf("add new cgnat rules: %w", err)
+	}
+	r.cgnatMode = want
+	return nil
 }
 
 var dockerStatefulFilteringWarnable = health.Register(&health.Warnable{
@@ -581,7 +667,7 @@ func (r *linuxRouter) updateMagicsockPort(port uint16, network string) error {
 	}
 
 	if port != 0 {
-		if err := r.nfr.AddMagicsockPortRule(*magicsockPort, network); err != nil {
+		if err := r.nfr.AddMagicsockPortRule(port, network); err != nil {
 			return fmt.Errorf("add magicsock port rule: %w", err)
 		}
 	}
@@ -733,6 +819,20 @@ func (r *linuxRouter) setNetfilterModeLocked(mode preftype.NetfilterMode) error 
 	for cidr := range r.addrs {
 		if err := r.addLoopbackRule(cidr.Addr()); err != nil {
 			return fmt.Errorf("error adding loopback rule: %w", err)
+		}
+	}
+
+	// Re-add the CGNAT rules if we had any set.
+	// This does not call [linuxRouter.setCGNATDropModeLocked] because that
+	// function assumes that [linuxRouter.cgnatMode] accurately represents the
+	// current state in the firewall. This would not be true when we hit this
+	// code path, and is what we're fixing up here.
+	if r.cgnatMode != "" {
+		if err := r.nfr.AddExternalCGNATRules(r.cgnatMode, r.tunname); err != nil {
+			// We currently have no rules set, so change the state to reflect that
+			// so we might try again on a future Router update.
+			r.cgnatMode = ""
+			return fmt.Errorf("add cgnat rules: %w", err)
 		}
 	}
 
@@ -1617,7 +1717,7 @@ func checkOpenWRTUsingMWAN3() (bool, error) {
 		// We want to match on a rule like this:
 		//    2001:	from all fwmark 0x100/0x3f00 lookup 1
 		//
-		// We dont match on the mask because it can vary, or the
+		// We don't match on the mask because it can vary, or the
 		// table because I'm not sure if it can vary.
 		if r.Priority >= 2001 && r.Priority <= 2004 && r.Mark != 0 {
 			return true, nil

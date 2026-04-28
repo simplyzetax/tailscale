@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package derpserver
@@ -9,17 +9,21 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/asn1"
+	"encoding/binary"
 	"expvar"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
+	"github.com/axiomhq/hyperloglog"
 	qt "github.com/frankban/quicktest"
 	"go4.org/mem"
 	"golang.org/x/time/rate"
@@ -27,6 +31,7 @@ import (
 	"tailscale.com/derp/derpconst"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/set"
 )
 
 const testMeshKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -625,22 +630,17 @@ func BenchmarkConcurrentStreams(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer ln.Close()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := b.Context()
 
+	acceptDone := make(chan struct{})
 	go func() {
-		for ctx.Err() == nil {
+		defer close(acceptDone)
+		for {
 			connIn, err := ln.Accept()
 			if err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				b.Error(err)
 				return
 			}
-
 			brwServer := bufio.NewReadWriter(bufio.NewReader(connIn), bufio.NewWriter(connIn))
 			go s.Accept(ctx, connIn, brwServer, "test-client")
 		}
@@ -678,6 +678,9 @@ func BenchmarkConcurrentStreams(b *testing.B) {
 			}
 		}
 	})
+
+	ln.Close()
+	<-acceptDone
 }
 
 func BenchmarkSendRecv(b *testing.B) {
@@ -755,6 +758,35 @@ func TestParseSSOutput(t *testing.T) {
 	}
 }
 
+func TestServeDebugTrafficUniqueSenders(t *testing.T) {
+	s := New(key.NewNode(), t.Logf)
+	defer s.Close()
+
+	clientKey := key.NewNode().Public()
+	c := &sclient{
+		key:               clientKey,
+		s:                 s,
+		logf:              logger.Discard,
+		senderCardinality: hyperloglog.New(),
+	}
+
+	for range 5 {
+		c.senderCardinality.Insert(key.NewNode().Public().AppendTo(nil))
+	}
+
+	s.mu.Lock()
+	cs := &clientSet{}
+	cs.activeClient.Store(c)
+	s.clients[clientKey] = cs
+	s.mu.Unlock()
+
+	estimate := c.EstimatedUniqueSenders()
+	t.Logf("Estimated unique senders: %d", estimate)
+	if estimate < 4 || estimate > 6 {
+		t.Errorf("EstimatedUniqueSenders() = %d, want ~5 (4-6 range)", estimate)
+	}
+}
+
 func TestGetPerClientSendQueueDepth(t *testing.T) {
 	c := qt.New(t)
 	envKey := "TS_DEBUG_DERP_PER_CLIENT_SEND_QUEUE_DEPTH"
@@ -779,4 +811,622 @@ func TestGetPerClientSendQueueDepth(t *testing.T) {
 			c.Assert(val, qt.Equals, tc.want)
 		})
 	}
+}
+
+func TestSenderCardinality(t *testing.T) {
+	s := New(key.NewNode(), t.Logf)
+	defer s.Close()
+
+	c := &sclient{
+		key:  key.NewNode().Public(),
+		s:    s,
+		logf: logger.WithPrefix(t.Logf, "test client: "),
+	}
+
+	if got := c.EstimatedUniqueSenders(); got != 0 {
+		t.Errorf("EstimatedUniqueSenders() before init = %d, want 0", got)
+	}
+
+	c.senderCardinality = hyperloglog.New()
+
+	if got := c.EstimatedUniqueSenders(); got != 0 {
+		t.Errorf("EstimatedUniqueSenders() with no senders = %d, want 0", got)
+	}
+
+	senders := make([]key.NodePublic, 10)
+	for i := range senders {
+		senders[i] = key.NewNode().Public()
+		c.senderCardinality.Insert(senders[i].AppendTo(nil))
+	}
+
+	estimate := c.EstimatedUniqueSenders()
+	t.Logf("Estimated unique senders after 10 inserts: %d", estimate)
+
+	if estimate < 8 || estimate > 12 {
+		t.Errorf("EstimatedUniqueSenders() = %d, want ~10 (8-12 range)", estimate)
+	}
+
+	for i := range 5 {
+		c.senderCardinality.Insert(senders[i].AppendTo(nil))
+	}
+
+	estimate2 := c.EstimatedUniqueSenders()
+	t.Logf("Estimated unique senders after duplicates: %d", estimate2)
+
+	if estimate2 < 8 || estimate2 > 12 {
+		t.Errorf("EstimatedUniqueSenders() after duplicates = %d, want ~10 (8-12 range)", estimate2)
+	}
+}
+
+func TestSenderCardinality100(t *testing.T) {
+	s := New(key.NewNode(), t.Logf)
+	defer s.Close()
+
+	c := &sclient{
+		key:               key.NewNode().Public(),
+		s:                 s,
+		logf:              logger.WithPrefix(t.Logf, "test client: "),
+		senderCardinality: hyperloglog.New(),
+	}
+
+	numSenders := 100
+	for range numSenders {
+		c.senderCardinality.Insert(key.NewNode().Public().AppendTo(nil))
+	}
+
+	estimate := c.EstimatedUniqueSenders()
+	t.Logf("Estimated unique senders for 100 actual senders: %d", estimate)
+
+	if estimate < 85 || estimate > 115 {
+		t.Errorf("EstimatedUniqueSenders() = %d, want ~100 (85-115 range)", estimate)
+	}
+}
+
+func TestSenderCardinalityTracking(t *testing.T) {
+	s := New(key.NewNode(), t.Logf)
+	defer s.Close()
+
+	c := &sclient{
+		key:               key.NewNode().Public(),
+		s:                 s,
+		logf:              logger.WithPrefix(t.Logf, "test client: "),
+		senderCardinality: hyperloglog.New(),
+	}
+
+	zeroKey := key.NodePublic{}
+	if zeroKey != (key.NodePublic{}) {
+		c.senderCardinality.Insert(zeroKey.AppendTo(nil))
+	}
+
+	if estimate := c.EstimatedUniqueSenders(); estimate != 0 {
+		t.Errorf("EstimatedUniqueSenders() after zero key = %d, want 0", estimate)
+	}
+
+	sender1 := key.NewNode().Public()
+	sender2 := key.NewNode().Public()
+
+	if sender1 != (key.NodePublic{}) {
+		c.senderCardinality.Insert(sender1.AppendTo(nil))
+	}
+	if sender2 != (key.NodePublic{}) {
+		c.senderCardinality.Insert(sender2.AppendTo(nil))
+	}
+
+	estimate := c.EstimatedUniqueSenders()
+	t.Logf("Estimated unique senders after 2 senders: %d", estimate)
+
+	if estimate < 1 || estimate > 3 {
+		t.Errorf("EstimatedUniqueSenders() = %d, want ~2 (1-3 range)", estimate)
+	}
+}
+
+func BenchmarkHyperLogLogInsert(b *testing.B) {
+	hll := hyperloglog.New()
+	sender := key.NewNode().Public()
+	senderBytes := sender.AppendTo(nil)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		hll.Insert(senderBytes)
+	}
+}
+
+func BenchmarkHyperLogLogInsertUnique(b *testing.B) {
+	hll := hyperloglog.New()
+
+	b.ResetTimer()
+
+	buf := make([]byte, 32)
+	for i := 0; i < b.N; i++ {
+		binary.LittleEndian.PutUint64(buf, uint64(i))
+		hll.Insert(buf)
+	}
+}
+
+func BenchmarkHyperLogLogEstimate(b *testing.B) {
+	hll := hyperloglog.New()
+
+	for range 100 {
+		hll.Insert(key.NewNode().Public().AppendTo(nil))
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = hll.Estimate()
+	}
+}
+
+func TestPerClientRateLimit(t *testing.T) {
+	t.Run("throttled", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+
+			c := &sclient{
+				ctx: ctx,
+			}
+			lim := &parentChildTokenBuckets{
+				// Set parent limit to half of child to enable verification of
+				// rate limiting across both layers with a single sclient.
+				parent: rate.NewLimiter(rate.Limit(minRateLimitTokenBucketSize)/2, minRateLimitTokenBucketSize),
+				child:  rate.NewLimiter(rate.Limit(minRateLimitTokenBucketSize), minRateLimitTokenBucketSize),
+			}
+			c.recvLim.Store(lim)
+			wantTokens := func(t *testing.T, wantParentTokens, wantChildTokens float64) {
+				t.Helper()
+				if lim.parent.Tokens() != wantParentTokens {
+					t.Fatalf("want parent tokens: %v got: %v", wantParentTokens, lim.parent.Tokens())
+				}
+				if lim.child.Tokens() != wantChildTokens {
+					t.Fatalf("want child tokens: %v got: %v", wantChildTokens, lim.child.Tokens())
+				}
+			}
+
+			// First call within burst should not block.
+			c.rateLimit(minRateLimitTokenBucketSize)
+
+			wantTokens(t, 0, 0)
+
+			// Next call exceeds burst, should block until tokens replenish.
+			done := make(chan error, 1)
+			go func() {
+				done <- c.rateLimit(minRateLimitTokenBucketSize)
+			}()
+
+			// After settling, the goroutine should be blocked (no result yet).
+			synctest.Wait()
+			select {
+			case err := <-done:
+				t.Fatalf("rateLimit should have blocked, but returned: %v", err)
+			default:
+			}
+
+			// Advance time by 1 second, the goroutine should still be blocked
+			// on the parent bucket (negative tokens).
+			time.Sleep(1 * time.Second)
+			synctest.Wait()
+			select {
+			case err := <-done:
+				t.Fatalf("rateLimit should have blocked, but returned: %v", err)
+			default:
+			}
+
+			// Verify the parent bucket fills at half the rate of the child.
+			wantTokens(t, -(minRateLimitTokenBucketSize / 2), 0)
+
+			// Advance time by another second, parent should have enough tokens
+			// to unblock.
+			time.Sleep(1 * time.Second)
+			synctest.Wait()
+
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("rateLimit after time advance: %v", err)
+				}
+			default:
+				t.Fatal("rateLimit should have unblocked after 1s")
+			}
+
+			wantTokens(t, 0, minRateLimitTokenBucketSize)
+		})
+	})
+
+	t.Run("context_canceled", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+
+			c := &sclient{
+				ctx: ctx,
+			}
+			lim := &parentChildTokenBuckets{
+				child:  rate.NewLimiter(rate.Limit(minRateLimitTokenBucketSize), minRateLimitTokenBucketSize),
+				parent: rate.NewLimiter(rate.Limit(minRateLimitTokenBucketSize), minRateLimitTokenBucketSize),
+			}
+			c.recvLim.Store(lim)
+
+			// Exhaust burst.
+			if err := c.rateLimit(minRateLimitTokenBucketSize); err != nil {
+				t.Fatalf("rateLimit: %v", err)
+			}
+
+			done := make(chan error, 1)
+			go func() {
+				done <- c.rateLimit(minRateLimitTokenBucketSize)
+			}()
+			synctest.Wait()
+
+			// Cancel the context; the blocked rateLimit should return an error.
+			cancel()
+			synctest.Wait()
+
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("expected error from canceled context")
+				}
+			default:
+				t.Fatal("rateLimit should have returned after context cancelation")
+			}
+		})
+	})
+
+	t.Run("mesh_peer_exempt", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+
+		// Mesh peers have nil recvLim, so rate limiting is a no-op.
+		c := &sclient{
+			ctx:     ctx,
+			canMesh: true,
+		}
+
+		if err := c.rateLimit(1000); err != nil {
+			t.Fatalf("mesh peer rateLimit should be no-op: %v", err)
+		}
+	})
+
+	t.Run("zero_config_no_limiter", func(t *testing.T) {
+		s := New(key.NewNode(), logger.Discard)
+		defer s.Close()
+		if !reflect.DeepEqual(s.rateConfig, RateConfig{}) {
+			t.Errorf("expected zero rate limit, got %+v", s.rateConfig)
+		}
+	})
+}
+
+func verifyLimiter(t *testing.T, lim *parentChildTokenBuckets, wantRateConfig RateConfig) {
+	t.Helper()
+	if got := lim.child.Limit(); got != rate.Limit(wantRateConfig.PerClientRateLimitBytesPerSec) {
+		t.Errorf("client rate limit = %v; want %d", got, wantRateConfig.PerClientRateLimitBytesPerSec)
+	}
+	if got := lim.child.Burst(); got != int(wantRateConfig.PerClientRateBurstBytes) {
+		t.Errorf("client burst = %v; want %d", got, wantRateConfig.PerClientRateBurstBytes)
+	}
+	if got := lim.parent.Limit(); got != rate.Limit(wantRateConfig.GlobalRateLimitBytesPerSec) {
+		t.Errorf("global rate limit = %v, want %d", got, wantRateConfig.GlobalRateLimitBytesPerSec)
+	}
+	if got := lim.parent.Burst(); got != int(wantRateConfig.GlobalRateBurstBytes) {
+		t.Errorf("global burst = %v, want %d", got, wantRateConfig.GlobalRateBurstBytes)
+	}
+}
+
+func TestUpdateRateLimits(t *testing.T) {
+	const (
+		testClientBurst1 = minRateLimitTokenBucketSize + 1
+		testClientRate1  = minRateLimitTokenBucketSize + 2
+		testClientBurst2 = minRateLimitTokenBucketSize + 3
+		testClientRate2  = minRateLimitTokenBucketSize + 4
+		testGlobalBurst1 = minRateLimitTokenBucketSize + 5
+		testGlobalRate1  = minRateLimitTokenBucketSize + 6
+		testGlobalBurst2 = minRateLimitTokenBucketSize + 7
+		testGlobalRate2  = minRateLimitTokenBucketSize + 8
+	)
+
+	s := New(key.NewNode(), t.Logf)
+	defer s.Close()
+
+	// Create a non-mesh client with no initial limiter.
+	clientKey := key.NewNode().Public()
+	c := &sclient{
+		key:     clientKey,
+		s:       s,
+		logf:    logger.Discard,
+		canMesh: false,
+	}
+	cs := &clientSet{}
+	cs.activeClient.Store(c)
+
+	s.mu.Lock()
+	s.clients[clientKey] = cs
+	s.mu.Unlock()
+
+	rc := RateConfig{
+		PerClientRateLimitBytesPerSec: testClientRate1,
+		PerClientRateBurstBytes:       testClientBurst1,
+		GlobalRateLimitBytesPerSec:    testGlobalRate1,
+		GlobalRateBurstBytes:          testGlobalBurst1,
+	}
+	s.UpdateRateLimits(rc)
+
+	lim := c.recvLim.Load()
+	if lim == nil {
+		t.Fatal("expected non-nil limiter after update")
+	}
+	verifyLimiter(t, lim, rc)
+
+	// Verify server fields updated.
+	s.mu.Lock()
+	if !reflect.DeepEqual(s.rateConfig, rc) {
+		t.Errorf("s.rateConfig = %+v; want %+v", s.rateConfig, rc)
+	}
+	s.mu.Unlock()
+
+	// Update again with different nonzero values.
+	rc = RateConfig{
+		PerClientRateLimitBytesPerSec: testClientRate2,
+		PerClientRateBurstBytes:       testClientBurst2,
+		GlobalRateLimitBytesPerSec:    testGlobalRate2,
+		GlobalRateBurstBytes:          testGlobalBurst2,
+	}
+	s.UpdateRateLimits(rc)
+	lim = c.recvLim.Load()
+	if lim == nil {
+		t.Fatal("expected non-nil limiter")
+	}
+	verifyLimiter(t, lim, rc)
+
+	// Disable rate limiting (set to 0).
+	s.UpdateRateLimits(RateConfig{})
+
+	if got := c.recvLim.Load(); got != nil {
+		t.Errorf("expected nil limiter after disable, got limit=%v", got.child.Limit())
+	}
+
+	// Mesh peer should always have nil limiter regardless of update.
+	meshKey := key.NewNode().Public()
+	meshClient := &sclient{
+		key:     meshKey,
+		s:       s,
+		logf:    logger.Discard,
+		canMesh: true,
+	}
+	meshCS := &clientSet{}
+	meshCS.activeClient.Store(meshClient)
+
+	s.mu.Lock()
+	s.clients[meshKey] = meshCS
+	s.mu.Unlock()
+
+	rc = RateConfig{
+		PerClientRateLimitBytesPerSec: testClientRate2,
+		PerClientRateBurstBytes:       testClientBurst2,
+		GlobalRateLimitBytesPerSec:    testGlobalRate2,
+		GlobalRateBurstBytes:          testGlobalBurst2,
+	}
+	s.UpdateRateLimits(rc)
+
+	if got := meshClient.recvLim.Load(); got != nil {
+		t.Errorf("mesh peer should have nil limiter, got limit=%v", got.child.Limit())
+	}
+	// Non-mesh client should be updated.
+	lim = c.recvLim.Load()
+	if lim == nil {
+		t.Fatal("expected non-nil limiter for non-mesh client")
+	}
+	verifyLimiter(t, lim, rc)
+
+	// Verify dup clients are also updated.
+	dupKey := key.NewNode().Public()
+	d1 := &sclient{key: dupKey, s: s, logf: logger.Discard}
+	d2 := &sclient{key: dupKey, s: s, logf: logger.Discard}
+	dupCS := &clientSet{}
+	dupCS.activeClient.Store(d1)
+	dupCS.dup = &dupClientSet{set: set.Of(d1, d2)}
+	s.mu.Lock()
+	s.clients[dupKey] = dupCS
+	s.mu.Unlock()
+
+	rc = RateConfig{
+		GlobalRateLimitBytesPerSec:    testGlobalRate1,
+		GlobalRateBurstBytes:          testGlobalBurst1,
+		PerClientRateLimitBytesPerSec: testClientRate1,
+		PerClientRateBurstBytes:       testClientBurst1,
+	}
+	s.UpdateRateLimits(rc)
+	for i, d := range []*sclient{d1, d2} {
+		dl := d.recvLim.Load()
+		if dl == nil {
+			t.Fatalf("dup client %d: expected non-nil limiter", i)
+		}
+		verifyLimiter(t, dl, rc)
+	}
+}
+
+func TestLoadRateConfig(t *testing.T) {
+	for _, tt := range []struct {
+		name           string
+		json           string
+		wantRateConfig RateConfig
+	}{
+		{"all_set", `{"PerClientRateLimitBytesPerSec": 1, "PerClientRateBurstBytes": 2, "GlobalRateLimitBytesPerSec": 3, "GlobalRateBurstBytes": 4}`, RateConfig{
+			PerClientRateLimitBytesPerSec: 1,
+			PerClientRateBurstBytes:       2,
+			GlobalRateLimitBytesPerSec:    3,
+			GlobalRateBurstBytes:          4,
+		}},
+		{"rate_only", `{"PerClientRateLimitBytesPerSec": 1, "GlobalRateLimitBytesPerSec": 3}`, RateConfig{
+			PerClientRateLimitBytesPerSec: 1,
+			GlobalRateLimitBytesPerSec:    3,
+		}},
+		{"zeros", `{"PerClientRateLimitBytesPerSec": 0, "PerClientRateBurstBytes": 0, "GlobalRateLimitBytesPerSec": 0, "GlobalRateBurstBytes": 0}`, RateConfig{}},
+		{"empty_json", `{}`, RateConfig{}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := filepath.Join(t.TempDir(), "rate.json")
+			if err := os.WriteFile(f, []byte(tt.json), 0644); err != nil {
+				t.Fatal(err)
+			}
+			rc, err := LoadRateConfig(f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(rc, tt.wantRateConfig) {
+				t.Errorf("rate config = %v want %v", rc, tt.wantRateConfig)
+			}
+		})
+	}
+
+	for _, tt := range []struct {
+		name    string
+		path    string
+		content string // written to loaded path if non-empty; path used as-is if empty
+	}{
+		{"empty_path", "", ""},
+		{"missing_file", filepath.Join(t.TempDir(), "nonexistent.json"), ""},
+		{"invalid_json", "", "not json"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			path := tt.path
+			if tt.content != "" {
+				path = filepath.Join(t.TempDir(), "rate.json")
+				if err := os.WriteFile(path, []byte(tt.content), 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, err := LoadRateConfig(path)
+			if err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
+}
+
+func TestLoadAndApplyRateConfig(t *testing.T) {
+	writeConfig := func(t *testing.T, json string) string {
+		t.Helper()
+		f := filepath.Join(t.TempDir(), "rate.json")
+		if err := os.WriteFile(f, []byte(json), 0644); err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+
+	t.Run("applies_and_updates_clients", func(t *testing.T) {
+		s := New(key.NewNode(), t.Logf)
+		defer s.Close()
+
+		clientKey := key.NewNode().Public()
+		c := &sclient{key: clientKey, s: s, logf: logger.Discard}
+		cs := &clientSet{}
+		cs.activeClient.Store(c)
+		s.mu.Lock()
+		s.clients[clientKey] = cs
+		s.mu.Unlock()
+
+		f := writeConfig(t, fmt.Sprintf(`{"PerClientRateLimitBytesPerSec": %d, "PerClientRateBurstBytes": %d, "GlobalRateLimitBytesPerSec": %d, "GlobalRateBurstBytes": %d}`,
+			minRateLimitTokenBucketSize, minRateLimitTokenBucketSize+1, minRateLimitTokenBucketSize+2, minRateLimitTokenBucketSize+3))
+		if err := s.LoadAndApplyRateConfig(f); err != nil {
+			t.Fatalf("LoadAndApplyRateConfig: %v", err)
+		}
+
+		// Verify server fields.
+		wantRateConfig := RateConfig{
+			PerClientRateLimitBytesPerSec: minRateLimitTokenBucketSize,
+			PerClientRateBurstBytes:       minRateLimitTokenBucketSize + 1,
+			GlobalRateLimitBytesPerSec:    minRateLimitTokenBucketSize + 2,
+			GlobalRateBurstBytes:          minRateLimitTokenBucketSize + 3,
+		}
+		s.mu.Lock()
+		if !reflect.DeepEqual(s.rateConfig, wantRateConfig) {
+			t.Errorf("s.rateConfig = %+v; want %+v", s.rateConfig, wantRateConfig)
+		}
+		s.mu.Unlock()
+
+		// Verify client limiter.
+		lim := c.recvLim.Load()
+		if lim == nil {
+			t.Fatal("expected non-nil limiter")
+		}
+		verifyLimiter(t, lim, wantRateConfig)
+	})
+
+	t.Run("burst_is_at_least_minRateLimitTokenBucketSize", func(t *testing.T) {
+		s := New(key.NewNode(), t.Logf)
+		defer s.Close()
+
+		f := writeConfig(t, `{"PerClientRateLimitBytesPerSec": 1250000, "PerClientRateBurstBytes": 10, "GlobalRateLimitBytesPerSec": 1250000, "GlobalRateBurstBytes": 10}`)
+		if err := s.LoadAndApplyRateConfig(f); err != nil {
+			t.Fatalf("LoadAndApplyRateConfig: %v", err)
+		}
+
+		s.mu.Lock()
+		gotClientBurst := s.rateConfig.PerClientRateBurstBytes
+		gotGlobalBurst := s.rateConfig.GlobalRateBurstBytes
+		s.mu.Unlock()
+		if gotClientBurst != minRateLimitTokenBucketSize {
+			t.Errorf("client burst = %d; want %d", gotClientBurst, minRateLimitTokenBucketSize)
+		}
+		if gotGlobalBurst != minRateLimitTokenBucketSize {
+			t.Errorf("global burst = %d; want %d", gotGlobalBurst, minRateLimitTokenBucketSize)
+		}
+	})
+
+	t.Run("reload_disables_limiting", func(t *testing.T) {
+		s := New(key.NewNode(), t.Logf)
+		defer s.Close()
+
+		f := writeConfig(t, `{"PerClientRateLimitBytesPerSec": 1250000, "PerClientRateBurstBytes": 2500000, "GlobalRateLimitBytesPerSec": 12500000, "GlobalRateBurstBytes": 25000000}`)
+		if err := s.LoadAndApplyRateConfig(f); err != nil {
+			t.Fatal(err)
+		}
+		s.mu.Lock()
+		if reflect.DeepEqual(s.rateConfig, RateConfig{}) {
+			t.Error("s.rateConfig is zero val; want nonzero rates")
+		}
+		s.mu.Unlock()
+
+		if err := os.WriteFile(f, []byte(`{}`), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.LoadAndApplyRateConfig(f); err != nil {
+			t.Fatal(err)
+		}
+
+		s.mu.Lock()
+		if !reflect.DeepEqual(s.rateConfig, RateConfig{}) {
+			t.Errorf("s.rateConfig = %+v; want %+v", s.rateConfig, RateConfig{})
+		}
+		s.mu.Unlock()
+	})
+
+	t.Run("propagates_errors", func(t *testing.T) {
+		s := New(key.NewNode(), t.Logf)
+		defer s.Close()
+
+		if err := s.LoadAndApplyRateConfig(filepath.Join(t.TempDir(), "nonexistent.json")); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+}
+
+func BenchmarkSenderCardinalityOverhead(b *testing.B) {
+	hll := hyperloglog.New()
+	sender := key.NewNode().Public()
+
+	b.Run("WithTracking", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if hll != nil {
+				hll.Insert(sender.AppendTo(nil))
+			}
+		}
+	})
+
+	b.Run("WithoutTracking", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_ = sender.AppendTo(nil)
+		}
+	})
 }

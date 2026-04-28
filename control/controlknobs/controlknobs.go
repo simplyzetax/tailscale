@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package controlknobs contains client options configurable from control which can be turned on
@@ -107,6 +107,20 @@ type Knobs struct {
 	// of queued netmap.NetworkMap between the controlclient and LocalBackend.
 	// See tailscale/tailscale#14768.
 	DisableSkipStatusQueue atomic.Bool
+
+	// DisableHostsFileUpdates indicates that the node's DNS manager should not create
+	// hosts file entries when it normally would, such as when we're not the primary
+	// resolver on Windows or when the host is domain-joined and its primary domain
+	// takes precedence over MagicDNS. As of 2026-02-13, it is only used on Windows.
+	DisableHostsFileUpdates atomic.Bool
+
+	// ForceRegisterMagicDNSIPv4Only is whether the node should only register
+	// its IPv4 MagicDNS service IP and not its IPv6 one. The IPv6 one,
+	// tsaddr.TailscaleServiceIPv6String, still works in either case. This knob
+	// controls only whether we tell systemd/etc about the IPv6 one.
+	// See https://github.com/tailscale/tailscale/issues/15404.
+	// TODO(bradfitz): remove this a few releases after 2026-02-16.
+	ForceRegisterMagicDNSIPv4Only atomic.Bool
 }
 
 // UpdateFromNodeAttributes updates k (if non-nil) based on the provided self
@@ -137,6 +151,8 @@ func (k *Knobs) UpdateFromNodeAttributes(capMap tailcfg.NodeCapMap) {
 		disableLocalDNSOverrideViaNRPT       = has(tailcfg.NodeAttrDisableLocalDNSOverrideViaNRPT)
 		disableCaptivePortalDetection        = has(tailcfg.NodeAttrDisableCaptivePortalDetection)
 		disableSkipStatusQueue               = has(tailcfg.NodeAttrDisableSkipStatusQueue)
+		disableHostsFileUpdates              = has(tailcfg.NodeAttrDisableHostsFileUpdates)
+		forceRegisterMagicDNSIPv4Only        = has(tailcfg.NodeAttrForceRegisterMagicDNSIPv4Only)
 	)
 
 	if has(tailcfg.NodeAttrOneCGNATEnable) {
@@ -163,6 +179,8 @@ func (k *Knobs) UpdateFromNodeAttributes(capMap tailcfg.NodeCapMap) {
 	k.DisableLocalDNSOverrideViaNRPT.Store(disableLocalDNSOverrideViaNRPT)
 	k.DisableCaptivePortalDetection.Store(disableCaptivePortalDetection)
 	k.DisableSkipStatusQueue.Store(disableSkipStatusQueue)
+	k.DisableHostsFileUpdates.Store(disableHostsFileUpdates)
+	k.ForceRegisterMagicDNSIPv4Only.Store(forceRegisterMagicDNSIPv4Only)
 
 	// If both attributes are present, then "enable" should win.  This reflects
 	// the history of seamless key renewal.
@@ -187,18 +205,22 @@ func (k *Knobs) AsDebugJSON() map[string]any {
 		return nil
 	}
 	ret := map[string]any{}
-	rt := reflect.TypeFor[Knobs]()
 	rv := reflect.ValueOf(k).Elem() // of *k
-	for i := 0; i < rt.NumField(); i++ {
-		name := rt.Field(i).Name
-		switch v := rv.Field(i).Addr().Interface().(type) {
+	for sf, fv := range rv.Fields() {
+		switch v := fv.Addr().Interface().(type) {
 		case *atomic.Bool:
-			ret[name] = v.Load()
+			ret[sf.Name] = v.Load()
 		case *syncs.AtomicValue[opt.Bool]:
-			ret[name] = v.Load()
+			ret[sf.Name] = v.Load()
 		default:
-			panic(fmt.Sprintf("unknown field type %T for %v", v, name))
+			panic(fmt.Sprintf("unknown field type %T for %v", v, sf.Name))
 		}
 	}
 	return ret
+}
+
+// ShouldForceRegisterMagicDNSIPv4Only reports the value of
+// ForceRegisterMagicDNSIPv4Only, or false if k is nil.
+func (k *Knobs) ShouldForceRegisterMagicDNSIPv4Only() bool {
+	return k != nil && k.ForceRegisterMagicDNSIPv4Only.Load()
 }

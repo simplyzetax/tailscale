@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package magicsock
@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"sync"
 	"sync/atomic"
 	"syscall"
 
@@ -16,6 +15,7 @@ import (
 	"tailscale.com/net/batching"
 	"tailscale.com/net/netaddr"
 	"tailscale.com/net/packet"
+	"tailscale.com/syncs"
 	"tailscale.com/types/nettype"
 )
 
@@ -31,7 +31,7 @@ type RebindingUDPConn struct {
 	// Neither is expected to be nil, sockets are bound on creation.
 	pconnAtomic atomic.Pointer[nettype.PacketConn]
 
-	mu    sync.Mutex // held while changing pconn (and pconnAtomic)
+	mu    syncs.Mutex // held while changing pconn (and pconnAtomic)
 	pconn nettype.PacketConn
 	port  uint16
 }
@@ -43,7 +43,7 @@ type RebindingUDPConn struct {
 // disrupting surrounding code that assumes nettype.PacketConn is a
 // *net.UDPConn.
 func (c *RebindingUDPConn) setConnLocked(p nettype.PacketConn, network string, batchSize int) {
-	upc := batching.TryUpgradeToConn(p, network, batchSize)
+	upc := batching.TryUpgradeToConn(p, network, batchSize, "magicsock_udp_rxq_overflows")
 	c.pconn = upc
 	c.pconnAtomic.Store(&upc)
 	c.port = uint16(c.localAddrLocked().Port)

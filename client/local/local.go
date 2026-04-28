@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package local contains a Go client for the Tailscale LocalAPI.
@@ -38,10 +38,12 @@ import (
 	"tailscale.com/net/udprelay/status"
 	"tailscale.com/paths"
 	"tailscale.com/safesocket"
+	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/appctype"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/key"
+	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/eventbus"
 )
 
@@ -190,8 +192,8 @@ func (e *AccessDeniedError) Unwrap() error { return e.err }
 
 // IsAccessDeniedError reports whether err is or wraps an AccessDeniedError.
 func IsAccessDeniedError(err error) bool {
-	var ae *AccessDeniedError
-	return errors.As(err, &ae)
+	_, ok := errors.AsType[*AccessDeniedError](err)
+	return ok
 }
 
 // PreconditionsFailedError is returned when the server responds
@@ -208,8 +210,8 @@ func (e *PreconditionsFailedError) Unwrap() error { return e.err }
 
 // IsPreconditionsFailedError reports whether err is or wraps an PreconditionsFailedError.
 func IsPreconditionsFailedError(err error) bool {
-	var ae *PreconditionsFailedError
-	return errors.As(err, &ae)
+	_, ok := errors.AsType[*PreconditionsFailedError](err)
+	return ok
 }
 
 // bestError returns either err, or if body contains a valid JSON
@@ -384,18 +386,14 @@ func (lc *Client) IncrementCounter(ctx context.Context, name string, delta int) 
 	if !buildfeatures.HasClientMetrics {
 		return nil
 	}
-	type metricUpdate struct {
-		Name  string `json:"name"`
-		Type  string `json:"type"`
-		Value int    `json:"value"` // amount to increment by
-	}
 	if delta < 0 {
 		return errors.New("negative delta not allowed")
 	}
-	_, err := lc.send(ctx, "POST", "/localapi/v0/upload-client-metrics", 200, jsonBody([]metricUpdate{{
+	_, err := lc.send(ctx, "POST", "/localapi/v0/upload-client-metrics", 200, jsonBody([]clientmetric.MetricUpdate{{
 		Name:  name,
 		Type:  "counter",
 		Value: delta,
+		Op:    "add",
 	}}))
 	return err
 }
@@ -404,15 +402,23 @@ func (lc *Client) IncrementCounter(ctx context.Context, name string, delta int) 
 // metric by the given delta. If the metric has yet to exist, a new gauge
 // metric is created and initialized to delta. The delta value can be negative.
 func (lc *Client) IncrementGauge(ctx context.Context, name string, delta int) error {
-	type metricUpdate struct {
-		Name  string `json:"name"`
-		Type  string `json:"type"`
-		Value int    `json:"value"` // amount to increment by
-	}
-	_, err := lc.send(ctx, "POST", "/localapi/v0/upload-client-metrics", 200, jsonBody([]metricUpdate{{
+	_, err := lc.send(ctx, "POST", "/localapi/v0/upload-client-metrics", 200, jsonBody([]clientmetric.MetricUpdate{{
 		Name:  name,
 		Type:  "gauge",
 		Value: delta,
+		Op:    "add",
+	}}))
+	return err
+}
+
+// SetGauge sets the value of a Tailscale daemon's gauge metric to the given value.
+// If the metric has yet to exist, a new gauge metric is created and initialized to value.
+func (lc *Client) SetGauge(ctx context.Context, name string, value int) error {
+	_, err := lc.send(ctx, "POST", "/localapi/v0/upload-client-metrics", 200, jsonBody([]clientmetric.MetricUpdate{{
+		Name:  name,
+		Type:  "gauge",
+		Value: value,
+		Op:    "set",
 	}}))
 	return err
 }
@@ -438,6 +444,11 @@ func (lc *Client) TailDaemonLogs(ctx context.Context) (io.Reader, error) {
 // as a [eventbus.DebugTopics]
 func (lc *Client) EventBusGraph(ctx context.Context) ([]byte, error) {
 	return lc.get200(ctx, "/localapi/v0/debug-bus-graph")
+}
+
+// EventBusQueues returns a JSON snapshot of event bus queue depths per client.
+func (lc *Client) EventBusQueues(ctx context.Context) ([]byte, error) {
+	return lc.get200(ctx, "/localapi/v0/debug-bus-queues")
 }
 
 // StreamBusEvents returns an iterator of Tailscale bus events as they arrive.
@@ -807,25 +818,6 @@ func (lc *Client) CheckUDPGROForwarding(ctx context.Context) error {
 	return nil
 }
 
-// CheckReversePathFiltering asks the local Tailscale daemon whether strict
-// reverse path filtering is enabled, which would break exit node usage on Linux.
-func (lc *Client) CheckReversePathFiltering(ctx context.Context) error {
-	body, err := lc.get200(ctx, "/localapi/v0/check-reverse-path-filtering")
-	if err != nil {
-		return err
-	}
-	var jres struct {
-		Warning string
-	}
-	if err := json.Unmarshal(body, &jres); err != nil {
-		return fmt.Errorf("invalid JSON from check-reverse-path-filtering: %w", err)
-	}
-	if jres.Warning != "" {
-		return errors.New(jres.Warning)
-	}
-	return nil
-}
-
 // SetUDPGROForwarding enables UDP GRO forwarding for the main interface of this
 // node. This can be done to improve performance of tailnet nodes acting as exit
 // nodes or subnet routers.
@@ -980,6 +972,19 @@ func (lc *Client) UserDial(ctx context.Context, network, host string, port uint1
 	if res.StatusCode != http.StatusSwitchingProtocols {
 		body, _ := io.ReadAll(res.Body)
 		res.Body.Close()
+		if res.StatusCode == http.StatusOK && res.Header.Get("Dial-Self") == "true" {
+			// Server told us to dial the address ourselves rather than
+			// proxying through the daemon. This happens for non-Tailscale
+			// addresses where the daemon shouldn't dial as root on the
+			// client's behalf. The server provides the resolved address
+			// to avoid a TOCTOU race with DNS re-resolution.
+			addr := res.Header.Get("Dial-Addr")
+			if addr == "" {
+				return nil, errors.New("server returned Dial-Self without Dial-Addr")
+			}
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
+		}
 		return nil, fmt.Errorf("unexpected HTTP response: %s, %s", res.Status, body)
 	}
 	// From here on, the underlying net.Conn is ours to use, but there
@@ -1079,7 +1084,7 @@ func tailscaledConnectHint() string {
 	// ActiveState=inactive
 	// SubState=dead
 	st := map[string]string{}
-	for _, line := range strings.Split(string(out), "\n") {
+	for line := range strings.SplitSeq(string(out), "\n") {
 		if k, v, ok := strings.Cut(line, "="); ok {
 			st[k] = strings.TrimSpace(v)
 		}
@@ -1363,7 +1368,7 @@ type IPNBusWatcher struct {
 	httpRes *http.Response
 	dec     *json.Decoder
 
-	mu     sync.Mutex
+	mu     syncs.Mutex
 	closed bool
 }
 
@@ -1400,6 +1405,23 @@ func (lc *Client) SuggestExitNode(ctx context.Context) (apitype.ExitNodeSuggesti
 	return decodeJSON[apitype.ExitNodeSuggestionResponse](body)
 }
 
+// CheckSOMarkInUse reports whether the socket mark option is in use. This will only
+// be true if tailscale is running on Linux and tailscaled uses SO_MARK.
+func (lc *Client) CheckSOMarkInUse(ctx context.Context) (bool, error) {
+	body, err := lc.get200(ctx, "/localapi/v0/check-so-mark-in-use")
+	if err != nil {
+		return false, err
+	}
+	var res struct {
+		UseSOMark bool `json:"useSoMark"`
+	}
+
+	if err := json.Unmarshal(body, &res); err != nil {
+		return false, fmt.Errorf("invalid JSON from check-so-mark-in-use: %w", err)
+	}
+	return res.UseSOMark, nil
+}
+
 // ShutdownTailscaled requests a graceful shutdown of tailscaled.
 func (lc *Client) ShutdownTailscaled(ctx context.Context) error {
 	_, err := lc.send(ctx, "POST", "/localapi/v0/shutdown", 200, nil)
@@ -1412,4 +1434,14 @@ func (lc *Client) GetAppConnectorRouteInfo(ctx context.Context) (appctype.RouteI
 		return appctype.RouteInfo{}, err
 	}
 	return decodeJSON[appctype.RouteInfo](body)
+}
+
+// GetServices returns the Services visible to this node,
+// including their names, IP addresses, and ports, keyed by service name.
+func (lc *Client) GetServices(ctx context.Context) (map[tailcfg.ServiceName]tailcfg.ServiceDetails, error) {
+	body, err := lc.get200(ctx, "/localapi/v0/services")
+	if err != nil {
+		return nil, err
+	}
+	return decodeJSON[map[tailcfg.ServiceName]tailcfg.ServiceDetails](body)
 }

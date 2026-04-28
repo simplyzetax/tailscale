@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux
@@ -51,6 +51,13 @@ type FirewallMode string
 const (
 	FirewallModeIPTables FirewallMode = "iptables"
 	FirewallModeNfTables FirewallMode = "nftables"
+)
+
+type CGNATMode string
+
+const (
+	CGNATModeDrop   CGNATMode = "DROP"
+	CGNATModeReturn CGNATMode = "RETURN"
 )
 
 // The following bits are added to packet marks for Tailscale use.

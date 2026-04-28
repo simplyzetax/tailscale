@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package config
@@ -20,7 +20,6 @@ import (
 	ktesting "k8s.io/client-go/testing"
 	"tailscale.com/kube/k8s-proxy/conf"
 	"tailscale.com/kube/kubetypes"
-	"tailscale.com/types/ptr"
 )
 
 func TestWatchConfig(t *testing.T) {
@@ -52,7 +51,7 @@ func TestWatchConfig(t *testing.T) {
 					initialConfig: `{"version": "v1alpha1", "authKey": "abc123"}`,
 					phases: []phase{{
 						expectedConf: &conf.ConfigV1Alpha1{
-							AuthKey: ptr.To("abc123"),
+							AuthKey: new("abc123"),
 						},
 					}},
 				},
@@ -62,7 +61,7 @@ func TestWatchConfig(t *testing.T) {
 					phases: []phase{
 						{
 							expectedConf: &conf.ConfigV1Alpha1{
-								AuthKey: ptr.To("abc123"),
+								AuthKey: new("abc123"),
 							},
 						},
 						{
@@ -76,13 +75,13 @@ func TestWatchConfig(t *testing.T) {
 					phases: []phase{
 						{
 							expectedConf: &conf.ConfigV1Alpha1{
-								AuthKey: ptr.To("abc123"),
+								AuthKey: new("abc123"),
 							},
 						},
 						{
 							config: `{"version": "v1alpha1", "authKey": "def456"}`,
 							expectedConf: &conf.ConfigV1Alpha1{
-								AuthKey: ptr.To("def456"),
+								AuthKey: new("def456"),
 							},
 						},
 					},
@@ -93,7 +92,7 @@ func TestWatchConfig(t *testing.T) {
 					phases: []phase{
 						{
 							expectedConf: &conf.ConfigV1Alpha1{
-								AuthKey: ptr.To("abc123"),
+								AuthKey: new("abc123"),
 							},
 						},
 						{
@@ -125,15 +124,15 @@ func TestWatchConfig(t *testing.T) {
 						}
 					}
 					configChan := make(chan *conf.Config)
-					l := NewConfigLoader(zap.Must(zap.NewDevelopment()).Sugar(), cl.CoreV1(), configChan)
-					l.cfgIgnored = make(chan struct{})
+					loader := NewConfigLoader(zap.Must(zap.NewDevelopment()).Sugar(), cl.CoreV1(), configChan)
+					loader.cfgIgnored = make(chan struct{})
 					errs := make(chan error)
 					ctx, cancel := context.WithCancel(t.Context())
 					defer cancel()
 
 					writeFile(t, tc.initialConfig)
 					go func() {
-						errs <- l.WatchConfig(ctx, cfgPath)
+						errs <- loader.WatchConfig(ctx, cfgPath)
 					}()
 
 					for i, p := range tc.phases {
@@ -159,7 +158,7 @@ func TestWatchConfig(t *testing.T) {
 							} else if !strings.Contains(err.Error(), p.expectedErr) {
 								t.Fatalf("expected error to contain %q, got %q", p.expectedErr, err.Error())
 							}
-						case <-l.cfgIgnored:
+						case <-loader.cfgIgnored:
 							if p.expectedConf != nil {
 								t.Fatalf("expected config to be reloaded, but got ignored signal")
 							}
@@ -192,13 +191,13 @@ func TestWatchConfigSecret_Rewatches(t *testing.T) {
 	})
 
 	configChan := make(chan *conf.Config)
-	l := NewConfigLoader(zap.Must(zap.NewDevelopment()).Sugar(), cl.CoreV1(), configChan)
+	loader := NewConfigLoader(zap.Must(zap.NewDevelopment()).Sugar(), cl.CoreV1(), configChan)
 
 	mustCreateOrUpdate(t, cl, secretFrom(expected[0]))
 
 	errs := make(chan error)
 	go func() {
-		errs <- l.watchConfigSecretChanges(t.Context(), "default", "config-secret")
+		errs <- loader.watchConfigSecretChanges(t.Context(), "default", "config-secret")
 	}()
 
 	for i := range 2 {
@@ -212,7 +211,7 @@ func TestWatchConfigSecret_Rewatches(t *testing.T) {
 			}
 		case err := <-errs:
 			t.Fatalf("unexpected error: %v", err)
-		case <-l.cfgIgnored:
+		case <-loader.cfgIgnored:
 			t.Fatalf("expected config to be reloaded, but got ignored signal")
 		case <-time.After(5 * time.Second):
 			t.Fatalf("timed out waiting for expected event")

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux
@@ -214,23 +214,8 @@ func (i *iptablesRunner) AddBase(tunname string) error {
 // addBase4 adds some basic IPv4 processing rules to be
 // supplemented by later calls to other helpers.
 func (i *iptablesRunner) addBase4(tunname string) error {
-	// Only allow CGNAT range traffic to come from tailscale0. There
-	// is an exception carved out for ranges used by ChromeOS, for
-	// which we fall out of the Tailscale chain.
-	//
-	// Note, this will definitely break nodes that end up using the
-	// CGNAT range for other purposes :(.
-	args := []string{"!", "-i", tunname, "-s", tsaddr.ChromeOSVMRange().String(), "-j", "RETURN"}
-	if err := i.ipt4.Append("filter", "ts-input", args...); err != nil {
-		return fmt.Errorf("adding %v in v4/filter/ts-input: %w", args, err)
-	}
-	args = []string{"!", "-i", tunname, "-s", tsaddr.CGNATRange().String(), "-j", "DROP"}
-	if err := i.ipt4.Append("filter", "ts-input", args...); err != nil {
-		return fmt.Errorf("adding %v in v4/filter/ts-input: %w", args, err)
-	}
-
-	// Explicitly allow all other inbound traffic to the tun interface
-	args = []string{"-i", tunname, "-j", "ACCEPT"}
+	// Explicitly allow all inbound traffic to the tun interface
+	args := []string{"-i", tunname, "-j", "ACCEPT"}
 	if err := i.ipt4.Append("filter", "ts-input", args...); err != nil {
 		return fmt.Errorf("adding %v in v4/filter/ts-input: %w", args, err)
 	}
@@ -527,6 +512,104 @@ func (i *iptablesRunner) DelStatefulRule(tunname string) error {
 	return nil
 }
 
+// AddConnmarkSaveRule adds conntrack marking rules to save and restore marks.
+// These rules run in mangle/PREROUTING (to restore marks from conntrack) and
+// mangle/OUTPUT (to save marks to conntrack) before rp_filter checks, enabling
+// proper routing table lookups for exit nodes and subnet routers.
+func (i *iptablesRunner) AddConnmarkSaveRule() error {
+	// Check if rules already exist (idempotency)
+	for _, ipt := range i.getTables() {
+		rules, err := ipt.List("mangle", "PREROUTING")
+		if err != nil {
+			continue
+		}
+		// Look for existing connmark restore rule
+		for _, rule := range rules {
+			if strings.Contains(rule, "CONNMARK") &&
+				strings.Contains(rule, "restore-mark") &&
+				strings.Contains(rule, "ctmask 0xff0000") {
+				// Rules already exist, skip adding
+				return nil
+			}
+		}
+	}
+
+	// mangle/PREROUTING: Restore mark from conntrack for ESTABLISHED/RELATED connections
+	// This runs BEFORE routing decision and rp_filter check
+	for _, ipt := range i.getTables() {
+		args := []string{
+			"-m", "conntrack",
+			"--ctstate", "ESTABLISHED,RELATED",
+			"-j", "CONNMARK",
+			"--restore-mark",
+			"--nfmask", fwmarkMask,
+			"--ctmask", fwmarkMask,
+		}
+		if err := ipt.Insert("mangle", "PREROUTING", 1, args...); err != nil {
+			return fmt.Errorf("adding %v in mangle/PREROUTING: %w", args, err)
+		}
+	}
+
+	// mangle/OUTPUT: Save mark to conntrack for NEW connections with non-zero marks
+	for _, ipt := range i.getTables() {
+		args := []string{
+			"-m", "conntrack",
+			"--ctstate", "NEW",
+			"-m", "mark",
+			"!", "--mark", "0x0/" + fwmarkMask,
+			"-j", "CONNMARK",
+			"--save-mark",
+			"--nfmask", fwmarkMask,
+			"--ctmask", fwmarkMask,
+		}
+		if err := ipt.Insert("mangle", "OUTPUT", 1, args...); err != nil {
+			return fmt.Errorf("adding %v in mangle/OUTPUT: %w", args, err)
+		}
+	}
+
+	return nil
+}
+
+// DelConnmarkSaveRule removes conntrack marking rules added by AddConnmarkSaveRule.
+func (i *iptablesRunner) DelConnmarkSaveRule() error {
+	for _, ipt := range i.getTables() {
+		// Delete PREROUTING rule
+		args := []string{
+			"-m", "conntrack",
+			"--ctstate", "ESTABLISHED,RELATED",
+			"-j", "CONNMARK",
+			"--restore-mark",
+			"--nfmask", fwmarkMask,
+			"--ctmask", fwmarkMask,
+		}
+		if err := ipt.Delete("mangle", "PREROUTING", args...); err != nil {
+			if !isNotExistError(err) {
+				return fmt.Errorf("deleting connmark rule in mangle/PREROUTING: %w", err)
+			}
+			// Rule doesn't exist - this is fine for idempotency
+		}
+
+		// Delete OUTPUT rule
+		args = []string{
+			"-m", "conntrack",
+			"--ctstate", "NEW",
+			"-m", "mark",
+			"!", "--mark", "0x0/" + fwmarkMask,
+			"-j", "CONNMARK",
+			"--save-mark",
+			"--nfmask", fwmarkMask,
+			"--ctmask", fwmarkMask,
+		}
+		if err := ipt.Delete("mangle", "OUTPUT", args...); err != nil {
+			if !isNotExistError(err) {
+				return fmt.Errorf("deleting connmark rule in mangle/OUTPUT: %w", err)
+			}
+			// Rule doesn't exist - this is fine for idempotency
+		}
+	}
+	return nil
+}
+
 // buildMagicsockPortRule generates the string slice containing the arguments
 // to describe a rule accepting traffic on a particular port to iptables. It is
 // separated out here to avoid repetition in AddMagicsockPortRule and
@@ -581,6 +664,67 @@ func (i *iptablesRunner) DelMagicsockPortRule(port uint16, network string) error
 		return fmt.Errorf("removing %v in filter/ts-input: %w", args, err)
 	}
 
+	return nil
+}
+
+// buildExternalCGNATRules abstracts out logic for constructing firewall rules
+// for handling non-Tailscale CGNAT traffic, since these rules need to be
+// identical across [AddExternalCGNATRules] and [DelExternalCGNATRules].
+func buildExternalCGNATRules(mode CGNATMode, tunname string) ([][]string, error) {
+	switch mode {
+	case CGNATModeDrop:
+		// Only allow CGNAT range traffic to come from the Tailscale interface.
+		// There is an exception carved out for ranges used by ChromeOS, for
+		// which we fall out of the Tailscale chain.
+		return [][]string{
+			{"!", "-i", tunname, "-s", tsaddr.ChromeOSVMRange().String(), "-j", "RETURN"},
+			{"!", "-i", tunname, "-s", tsaddr.CGNATRange().String(), "-j", "DROP"},
+		}, nil
+	case CGNATModeReturn:
+		// Fall out of the Tailscale chain for CGNAT traffic that doesn't
+		// originate from the Tailscale interface.
+		return [][]string{
+			{"!", "-i", tunname, "-s", tsaddr.CGNATRange().String(), "-j", "RETURN"},
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported mode %q", mode)
+	}
+}
+
+// AddExternalCGNATRules adds rules to the ts-input chain to deal with
+// traffic from the CGNAT range that arrives on non-Tailscale network
+// interfaces.
+func (i *iptablesRunner) AddExternalCGNATRules(mode CGNATMode, tunname string) error {
+	rules, err := buildExternalCGNATRules(mode, tunname)
+	if err != nil {
+		return fmt.Errorf("build cgnat mode rule: %v", err)
+	}
+	for _, rule := range rules {
+		if err := i.ipt4.Append("filter", "ts-input", rule...); err != nil {
+			return fmt.Errorf("adding %v in v4/filter/ts-input: %w", rule, err)
+		}
+	}
+	return nil
+}
+
+// DelExternalCGNATRules removes the rules created by AddExternalCGNATRules,
+// if they exist.
+func (i *iptablesRunner) DelExternalCGNATRules(mode CGNATMode, tunname string) error {
+	rules, err := buildExternalCGNATRules(mode, tunname)
+	if err != nil {
+		return fmt.Errorf("build cgnat mode rule: %v", err)
+	}
+	for _, rule := range rules {
+		if found, err := i.ipt4.Exists("filter", "ts-input", rule...); err != nil {
+			return fmt.Errorf("checking for %v in v4/filter/ts-input: %w", rule, err)
+		} else if !found {
+			// Don't need to delete a rule that isn't there.
+			continue
+		}
+		if err := i.ipt4.Delete("filter", "ts-input", rule...); err != nil {
+			return fmt.Errorf("deleting %v in v4/filter/ts-input: %w", rule, err)
+		}
+	}
 	return nil
 }
 

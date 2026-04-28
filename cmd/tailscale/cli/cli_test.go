@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package cli
@@ -6,11 +6,14 @@ package cli
 import (
 	"bytes"
 	stdcmp "cmp"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -20,6 +23,7 @@ import (
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"tailscale.com/envknob"
 	"tailscale.com/health/healthmsg"
+	"tailscale.com/internal/client/tailscale"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
@@ -174,6 +178,7 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 		curUser       string // os.Getenv("USER") on the client side
 		goos          string // empty means "linux"
 		distro        distro.Distro
+		backendState  string // empty means "Running"
 
 		want string
 	}{
@@ -187,6 +192,28 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 				NoStatefulFiltering: opt.NewBool(true),
 			},
 			want: "",
+		},
+		{
+			name:         "bare_up_needs_login_default_prefs",
+			flags:        []string{},
+			curPrefs:     ipn.NewPrefs(),
+			backendState: ipn.NeedsLogin.String(),
+			want:         "",
+		},
+		{
+			name:  "bare_up_needs_login_losing_prefs",
+			flags: []string{},
+			curPrefs: &ipn.Prefs{
+				// defaults:
+				ControlURL:          ipn.DefaultControlURL,
+				WantRunning:         false,
+				NetfilterMode:       preftype.NetfilterOn,
+				NoStatefulFiltering: opt.NewBool(true),
+				// non-default:
+				CorpDNS: false,
+			},
+			backendState: ipn.NeedsLogin.String(),
+			want:         accidentalUpPrefix + " --accept-dns=false",
 		},
 		{
 			name:  "losing_hostname",
@@ -620,9 +647,13 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			goos := "linux"
-			if tt.goos != "" {
-				goos = tt.goos
+			goos := stdcmp.Or(tt.goos, "linux")
+			backendState := stdcmp.Or(tt.backendState, ipn.Running.String())
+			// Needs to match the other conditions in checkForAccidentalSettingReverts
+			tt.curPrefs.Persist = &persist.Persist{
+				UserProfile: tailcfg.UserProfile{
+					LoginName: "janet",
+				},
 			}
 			var upArgs upArgsT
 			flagSet := newUpFlagSet(goos, &upArgs, "up")
@@ -638,10 +669,11 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 				curExitNodeIP: tt.curExitNodeIP,
 				distro:        tt.distro,
 				user:          tt.curUser,
+				backendState:  backendState,
 			}
 			applyImplicitPrefs(newPrefs, tt.curPrefs, upEnv)
 			var got string
-			if err := checkForAccidentalSettingReverts(newPrefs, tt.curPrefs, upEnv); err != nil {
+			if _, err := checkForAccidentalSettingReverts(newPrefs, tt.curPrefs, upEnv); err != nil {
 				got = err.Error()
 			}
 			if strings.TrimSpace(got) != tt.want {
@@ -737,7 +769,7 @@ func TestPrefsFromUpArgs(t *testing.T) {
 			args: upArgsT{
 				exitNodeIP: "foo",
 			},
-			wantErr: `invalid value "foo" for --exit-node; must be IP or unique node name`,
+			wantErr: `invalid value "foo" for --exit-node; must be IP or hostname`,
 		},
 		{
 			name: "error_exit_node_allow_lan_without_exit_node",
@@ -930,8 +962,8 @@ func TestPrefFlagMapping(t *testing.T) {
 	}
 
 	prefType := reflect.TypeFor[ipn.Prefs]()
-	for i := range prefType.NumField() {
-		prefName := prefType.Field(i).Name
+	for field := range prefType.Fields() {
+		prefName := field.Name
 		if prefHasFlag[prefName] {
 			continue
 		}
@@ -1011,13 +1043,10 @@ func TestUpdatePrefs(t *testing.T) {
 		wantErrSubtr   string
 	}{
 		{
-			name:  "bare_up_means_up",
-			flags: []string{},
-			curPrefs: &ipn.Prefs{
-				ControlURL:  ipn.DefaultControlURL,
-				WantRunning: false,
-				Hostname:    "foo",
-			},
+			name:         "bare_up_means_up",
+			flags:        []string{},
+			curPrefs:     ipn.NewPrefs(),
+			wantSimpleUp: false, // user profile not set, so no simple up
 		},
 		{
 			name:  "just_up",
@@ -1030,6 +1059,32 @@ func TestUpdatePrefs(t *testing.T) {
 				backendState: "Stopped",
 			},
 			wantSimpleUp: true,
+		},
+		{
+			name:     "just_up_needs_login_default_prefs",
+			flags:    []string{},
+			curPrefs: ipn.NewPrefs(),
+			env: upCheckEnv{
+				backendState: "NeedsLogin",
+			},
+			wantSimpleUp: false,
+		},
+		{
+			name:  "just_up_needs_login_losing_prefs",
+			flags: []string{},
+			curPrefs: &ipn.Prefs{
+				// defaults:
+				ControlURL:    ipn.DefaultControlURL,
+				WantRunning:   false,
+				NetfilterMode: preftype.NetfilterOn,
+				// non-default:
+				CorpDNS: false,
+			},
+			env: upCheckEnv{
+				backendState: "NeedsLogin",
+			},
+			wantSimpleUp: false,
+			wantErrSubtr: "tailscale up --accept-dns=false",
 		},
 		{
 			name:  "just_edit",
@@ -1478,13 +1533,13 @@ func TestParseNLArgs(t *testing.T) {
 			parseDisablements: true,
 		},
 		{
-			name:      "key no votes",
+			name:      "key-no-votes",
 			input:     []string{"nlpub:" + strings.Repeat("00", 32)},
 			parseKeys: true,
 			wantKeys:  []tka.Key{{Kind: tka.Key25519, Votes: 1, Public: bytes.Repeat([]byte{0}, 32)}},
 		},
 		{
-			name:      "key with votes",
+			name:      "key-with-votes",
 			input:     []string{"nlpub:" + strings.Repeat("01", 32) + "?5"},
 			parseKeys: true,
 			wantKeys:  []tka.Key{{Kind: tka.Key25519, Votes: 5, Public: bytes.Repeat([]byte{1}, 32)}},
@@ -1496,13 +1551,13 @@ func TestParseNLArgs(t *testing.T) {
 			wantDisablements:  [][]byte{bytes.Repeat([]byte{2}, 32), bytes.Repeat([]byte{3}, 32)},
 		},
 		{
-			name:      "disablements not allowed",
+			name:      "disablements-not-allowed",
 			input:     []string{"disablement:" + strings.Repeat("02", 32)},
 			parseKeys: true,
 			wantErr:   fmt.Errorf("parsing key 1: key hex string doesn't have expected type prefix tlpub:"),
 		},
 		{
-			name:              "keys not allowed",
+			name:              "keys-not-allowed",
 			input:             []string{"nlpub:" + strings.Repeat("02", 32)},
 			parseDisablements: true,
 			wantErr:           fmt.Errorf("parsing argument 1: expected value with \"disablement:\" or \"disablement-secret:\" prefix, got %q", "nlpub:0202020202020202020202020202020202020202020202020202020202020202"),
@@ -1563,7 +1618,7 @@ func TestNoDups(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cmd := newRootCmd()
+			cmd := newRootCmd(t)
 			makeQuietContinueOnError(cmd)
 			err := cmd.Parse(tt.args)
 			if got := fmt.Sprint(err); got != tt.want {
@@ -1645,6 +1700,78 @@ func TestDocs(t *testing.T) {
 	walk(t, root)
 }
 
+func TestUpResolves(t *testing.T) {
+	const testARN = "arn:aws:ssm:us-east-1:123456789012:parameter/my-parameter"
+	undo := tailscale.HookResolveValueFromParameterStore.SetForTest(func(_ context.Context, valueOrARN string) (string, error) {
+		if valueOrARN == testARN {
+			return "resolved-value", nil
+		}
+		return valueOrARN, nil
+	})
+	defer undo()
+
+	const content = "file-content"
+	fpath := filepath.Join(t.TempDir(), "testfile")
+	if err := os.WriteFile(fpath, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	testCases := []struct {
+		name string
+		arg  string
+		want string
+	}{
+		{"parameter_store", testARN, "resolved-value"},
+		{"file", "file:" + fpath, "file-content"},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.name+"_auth_key", func(t *testing.T) {
+			args := upArgsT{authKeyOrFile: tt.arg}
+			got, err := args.getAuthKey(t.Context())
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+
+		t.Run(tt.name+"_client_secret", func(t *testing.T) {
+			args := upArgsT{clientSecretOrFile: tt.arg}
+			got, err := args.getClientSecret(t.Context())
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+
+		t.Run(tt.name+"_id_token", func(t *testing.T) {
+			args := upArgsT{idTokenOrFile: tt.arg}
+			got, err := args.getIDToken(t.Context())
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+
+	t.Run("passthrough", func(t *testing.T) {
+		args := upArgsT{authKeyOrFile: "tskey-abcd1234"}
+		got, err := args.getAuthKey(t.Context())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != "tskey-abcd1234" {
+			t.Errorf("got %q, want %q", got, "tskey-abcd1234")
+		}
+	})
+}
+
 func TestDeps(t *testing.T) {
 	deptest.DepChecker{
 		GOOS:   "linux",
@@ -1671,4 +1798,22 @@ func TestDepsNoCapture(t *testing.T) {
 		},
 	}.Check(t)
 
+}
+
+func TestSanitizeWriter(t *testing.T) {
+	buf := new(bytes.Buffer)
+	w := sanitizeOutput(buf)
+
+	in := []byte(`my auth key is tskey-auth-abc123-def456 and tskey-foo, what's yours?`)
+	want := []byte(`my auth key is tskey-XXXXXXXXXXXXXXXXXX and tskey-XXX, what's yours?`)
+	n, err := w.Write(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len(in) {
+		t.Errorf("unexpected write length %d, want %d", n, len(in))
+	}
+	if got := buf.Bytes(); !bytes.Equal(got, want) {
+		t.Errorf("unexpected sanitized content\ngot: %q\nwant: %q", got, want)
+	}
 }

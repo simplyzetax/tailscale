@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package ipn
@@ -112,6 +112,36 @@ func TestHasPathHandler(t *testing.T) {
 							}},
 						},
 						AllowFunnel: map[HostPort]bool{"foo.test.ts.net:443": true},
+					},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "with-service-path-handler",
+			cfg: ServeConfig{
+				Services: map[tailcfg.ServiceName]*ServiceConfig{
+					"svc:foo": {
+						Web: map[HostPort]*WebServerConfig{
+							"foo.test.ts.net:443": {Handlers: map[string]*HTTPHandler{
+								"/": {Path: "/tmp"},
+							}},
+						},
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "with-service-proxy-handler",
+			cfg: ServeConfig{
+				Services: map[tailcfg.ServiceName]*ServiceConfig{
+					"svc:foo": {
+						Web: map[HostPort]*WebServerConfig{
+							"foo.test.ts.net:443": {Handlers: map[string]*HTTPHandler{
+								"/": {Proxy: "http://127.0.0.1:3000"},
+							}},
+						},
 					},
 				},
 			},
@@ -253,19 +283,23 @@ func TestExpandProxyTargetDev(t *testing.T) {
 		wantErr          bool
 	}{
 		{name: "port-only", input: "8080", expected: "http://127.0.0.1:8080"},
-		{name: "hostname+port", input: "localhost:8080", expected: "http://localhost:8080"},
+		{name: "hostname-and-port", input: "localhost:8080", expected: "http://localhost:8080"},
 		{name: "no-change", input: "http://127.0.0.1:8080", expected: "http://127.0.0.1:8080"},
 		{name: "include-path", input: "http://127.0.0.1:8080/foo", expected: "http://127.0.0.1:8080/foo"},
 		{name: "https-scheme", input: "https://localhost:8080", expected: "https://localhost:8080"},
-		{name: "https+insecure-scheme", input: "https+insecure://localhost:8080", expected: "https+insecure://localhost:8080"},
+		{name: "https-insecure-scheme", input: "https+insecure://localhost:8080", expected: "https+insecure://localhost:8080"},
 		{name: "change-default-scheme", input: "localhost:8080", defaultScheme: "https", expected: "https://localhost:8080"},
 		{name: "change-supported-schemes", input: "localhost:8080", defaultScheme: "tcp", supportedSchemes: []string{"tcp"}, expected: "tcp://localhost:8080"},
+		{name: "remote-target", input: "https://example.com:8080", expected: "https://example.com:8080"},
+		{name: "remote-IP-target", input: "http://120.133.20.2:8080", expected: "http://120.133.20.2:8080"},
+		{name: "remote-target-no-port", input: "https://example.com", expected: "https://example.com"},
 
 		// errors
 		{name: "invalid-port", input: "localhost:9999999", wantErr: true},
+		{name: "invalid-hostname", input: "192.168.1:8080", wantErr: true},
 		{name: "unsupported-scheme", input: "ftp://localhost:8080", expected: "", wantErr: true},
-		{name: "not-localhost", input: "https://tailscale.com:8080", expected: "", wantErr: true},
 		{name: "empty-input", input: "", expected: "", wantErr: true},
+		{name: "localhost-no-port", input: "localhost", expected: "", wantErr: true},
 	}
 
 	for _, tt := range tests {

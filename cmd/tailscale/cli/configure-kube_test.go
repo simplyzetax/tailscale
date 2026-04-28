@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 //go:build !ts_omit_kube
 
@@ -76,7 +76,7 @@ users:
     token: unused`,
 		},
 		{
-			name: "all configs, clusters, users have been deleted",
+			name: "all-configs-clusters-users-deleted",
 			in: `apiVersion: v1
 clusters: null
 contexts: null

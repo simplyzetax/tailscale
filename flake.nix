@@ -4,7 +4,7 @@
 # environment for working on tailscale, for use with "nix develop".
 #
 # For more information about this and why this file is useful, see:
-# https://nixos.wiki/wiki/Flakes
+# https://wiki.nixos.org/wiki/Flakes
 #
 # Also look into direnv: https://direnv.net/, this can make it so that you can
 # automatically get your environment set up when you change folders into the
@@ -55,7 +55,7 @@
           system = system;
           overlays = [
             (final: prev: {
-              go_1_25 = prev.go_1_25.overrideAttrs {
+              go_1_26 = prev.go_1_26.overrideAttrs (old: {
                 version = goVersion;
                 src = prev.fetchFromGitHub {
                   owner = "tailscale";
@@ -63,7 +63,19 @@
                   rev = toolChainRev;
                   sha256 = gitHash;
                 };
-              };
+                # The Tailscale Go fork carries a placeholder in
+                # src/runtime/debug/mod.go that must be replaced with
+                # the actual toolchain git rev at build time. Without
+                # this, binaries report an empty tailscale.toolchain.rev
+                # and the runtime assertion in
+                # assert_ts_toolchain_match.go panics.
+                postPatch =
+                  (old.postPatch or "")
+                  + ''
+                    substituteInPlace src/runtime/debug/mod.go \
+                      --replace-fail "TAILSCALE_GIT_REV_TO_BE_REPLACED_AT_BUILD_TIME" "${toolChainRev}"
+                  '';
+              });
             })
           ];
         }));
@@ -87,7 +99,7 @@
     # you're an end user you should be prepared for this flake to not
     # build periodically.
     packages = eachSystem (pkgs: rec {
-      default = pkgs.buildGo125Module {
+      default = pkgs.buildGo126Module {
         name = "tailscale";
         pname = "tailscale";
         src = ./.;
@@ -132,7 +144,7 @@
     });
 
     devShells = eachSystem (pkgs: {
-      devShell = pkgs.mkShell {
+      default = pkgs.mkShell {
         packages = with pkgs; [
           curl
           git
@@ -140,7 +152,7 @@
           gotools
           graphviz
           perl
-          go_1_25
+          go_1_26
           yarn
 
           # qemu and e2fsprogs are needed for natlab
@@ -151,5 +163,4 @@
     });
   };
 }
-# nix-direnv cache busting line: sha256-p8dVVZm2bLL4J/d4TtnUOp3bfMqUkBGE+53RUhamF+A=
-
+# nix-direnv cache busting line: sha256-5uzkG6NQh0znjgE6yV5b01y8bUlTvLqXyAoWbMRQNEY=

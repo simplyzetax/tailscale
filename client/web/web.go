@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package web provides the Tailscale client for web.
@@ -768,6 +768,19 @@ func (s *Server) serveAPIAuth(w http.ResponseWriter, r *http.Request) {
 			}
 		default:
 			// no additional auth for this distro
+		}
+	}
+
+	// We might have a session for which we haven't awaited the result yet.
+	// This can happen when the AuthURL opens in the same browser tab instead
+	// of a new one due to browser settings.
+	// (See https://github.com/tailscale/tailscale/issues/11905)
+	// We therefore set a PendingAuth flag when creating a new session, check
+	// it here and call awaitUserAuth if we find it to be true. Once the auth
+	// wait completes, awaitUserAuth will set PendingAuth to false.
+	if sErr == nil && session.PendingAuth == true {
+		if err := s.awaitUserAuth(r.Context(), session); err != nil {
+			sErr = err
 		}
 	}
 

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !ts_omit_tailnetlock
@@ -10,10 +10,11 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
+	jsonv1 "encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/mattn/go-isatty"
 	"github.com/peterbourgon/ff/v3/ffcli"
+	"tailscale.com/cmd/tailscale/cli/jsonoutput"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tka"
 	"tailscale.com/tsconst"
@@ -193,7 +195,7 @@ func runNetworkLockInit(ctx context.Context, args []string) error {
 }
 
 var nlStatusArgs struct {
-	json bool
+	json jsonoutput.JSONSchemaVersion
 }
 
 var nlStatusCmd = &ffcli.Command{
@@ -203,7 +205,7 @@ var nlStatusCmd = &ffcli.Command{
 	Exec:       runNetworkLockStatus,
 	FlagSet: (func() *flag.FlagSet {
 		fs := newFlagSet("lock status")
-		fs.BoolVar(&nlStatusArgs.json, "json", false, "output in JSON format (WARNING: format subject to change)")
+		fs.Var(&nlStatusArgs.json, "json", "output in JSON format")
 		return fs
 	})(),
 }
@@ -218,10 +220,12 @@ func runNetworkLockStatus(ctx context.Context, args []string) error {
 		return fixTailscaledConnectError(err)
 	}
 
-	if nlStatusArgs.json {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(st)
+	if nlStatusArgs.json.IsSet {
+		if nlStatusArgs.json.Value == 1 {
+			return jsonoutput.PrintNetworkLockStatusJSONV1(os.Stdout, st)
+		} else {
+			return fmt.Errorf("unrecognised version: %d", nlStatusArgs.json.Value)
+		}
 	}
 
 	if st.Enabled {
@@ -301,9 +305,7 @@ var nlAddCmd = &ffcli.Command{
 	Name:       "add",
 	ShortUsage: "tailscale lock add <public-key>...",
 	ShortHelp:  "Add one or more trusted signing keys to tailnet lock",
-	Exec: func(ctx context.Context, args []string) error {
-		return runNetworkLockModify(ctx, args, nil)
-	},
+	Exec:       runNetworkLockAdd,
 }
 
 var nlRemoveArgs struct {
@@ -326,6 +328,9 @@ func runNetworkLockRemove(ctx context.Context, args []string) error {
 	removeKeys, _, err := parseNLArgs(args, true, false)
 	if err != nil {
 		return err
+	}
+	if len(removeKeys) == 0 {
+		return fmt.Errorf("missing argument, expected one or more tailnet lock keys")
 	}
 	st, err := localClient.NetworkLockStatus(ctx)
 	if err != nil {
@@ -441,7 +446,15 @@ func parseNLArgs(args []string, parseKeys, parseDisablements bool) (keys []tka.K
 	return keys, disablements, nil
 }
 
-func runNetworkLockModify(ctx context.Context, addArgs, removeArgs []string) error {
+func runNetworkLockAdd(ctx context.Context, addArgs []string) error {
+	addKeys, _, err := parseNLArgs(addArgs, true, false)
+	if err != nil {
+		return err
+	}
+	if len(addKeys) == 0 {
+		return fmt.Errorf("missing argument, expected one or more tailnet lock keys")
+	}
+
 	st, err := localClient.NetworkLockStatus(ctx)
 	if err != nil {
 		return fixTailscaledConnectError(err)
@@ -450,16 +463,7 @@ func runNetworkLockModify(ctx context.Context, addArgs, removeArgs []string) err
 		return errors.New("tailnet lock is not enabled")
 	}
 
-	addKeys, _, err := parseNLArgs(addArgs, true, false)
-	if err != nil {
-		return err
-	}
-	removeKeys, _, err := parseNLArgs(removeArgs, true, false)
-	if err != nil {
-		return err
-	}
-
-	if err := localClient.NetworkLockModify(ctx, addKeys, removeKeys); err != nil {
+	if err := localClient.NetworkLockModify(ctx, addKeys, nil); err != nil {
 		return err
 	}
 	return nil
@@ -600,7 +604,7 @@ func runNetworkLockDisablementKDF(ctx context.Context, args []string) error {
 
 var nlLogArgs struct {
 	limit int
-	json  bool
+	json  jsonoutput.JSONSchemaVersion
 }
 
 var nlLogCmd = &ffcli.Command{
@@ -612,7 +616,7 @@ var nlLogCmd = &ffcli.Command{
 	FlagSet: (func() *flag.FlagSet {
 		fs := newFlagSet("lock log")
 		fs.IntVar(&nlLogArgs.limit, "limit", 50, "max number of updates to list")
-		fs.BoolVar(&nlLogArgs.json, "json", false, "output in JSON format (WARNING: format subject to change)")
+		fs.Var(&nlLogArgs.json, "json", "output in JSON format")
 		return fs
 	})(),
 }
@@ -668,7 +672,7 @@ func nlDescribeUpdate(update ipnstate.NetworkLockUpdate, color bool) (string, er
 
 	case tka.AUMCheckpoint.String():
 		fmt.Fprintln(&stanza, "Disablement values:")
-		for _, v := range aum.State.DisablementSecrets {
+		for _, v := range aum.State.DisablementValues {
 			fmt.Fprintf(&stanza, " - %x\n", v)
 		}
 		fmt.Fprintln(&stanza, "Keys:")
@@ -678,7 +682,7 @@ func nlDescribeUpdate(update ipnstate.NetworkLockUpdate, color bool) (string, er
 
 	default:
 		// Print a JSON encoding of the AUM as a fallback.
-		e := json.NewEncoder(&stanza)
+		e := jsonv1.NewEncoder(&stanza)
 		e.SetIndent("", "\t")
 		if err := e.Encode(aum); err != nil {
 			return "", err
@@ -702,13 +706,20 @@ func runNetworkLockLog(ctx context.Context, args []string) error {
 	if err != nil {
 		return fixTailscaledConnectError(err)
 	}
-	if nlLogArgs.json {
-		enc := json.NewEncoder(Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(updates)
-	}
 
 	out, useColor := colorableOutput()
+
+	return printNetworkLockLog(updates, out, nlLogArgs.json, useColor)
+}
+
+func printNetworkLockLog(updates []ipnstate.NetworkLockUpdate, out io.Writer, jsonSchema jsonoutput.JSONSchemaVersion, useColor bool) error {
+	if jsonSchema.IsSet {
+		if jsonSchema.Value == 1 {
+			return jsonoutput.PrintNetworkLockLogJSONV1(out, updates)
+		} else {
+			return fmt.Errorf("unrecognised version: %d", jsonSchema.Value)
+		}
+	}
 
 	for _, update := range updates {
 		stanza, err := nlDescribeUpdate(update, useColor)
@@ -808,13 +819,17 @@ Revocation is a multi-step process that requires several signing nodes to ` + "`
 func runNetworkLockRevokeKeys(ctx context.Context, args []string) error {
 	// First step in the process
 	if !nlRevokeKeysArgs.cosign && !nlRevokeKeysArgs.finish {
-		removeKeys, _, err := parseNLArgs(args, true, false)
+		revokeKeys, _, err := parseNLArgs(args, true, false)
 		if err != nil {
 			return err
 		}
 
-		keyIDs := make([]tkatype.KeyID, len(removeKeys))
-		for i, k := range removeKeys {
+		if len(revokeKeys) == 0 {
+			return fmt.Errorf("missing argument, expected one or more tailnet lock keys")
+		}
+
+		keyIDs := make([]tkatype.KeyID, len(revokeKeys))
+		for i, k := range revokeKeys {
 			keyIDs[i], err = k.ID()
 			if err != nil {
 				return fmt.Errorf("generating keyID: %v", err)

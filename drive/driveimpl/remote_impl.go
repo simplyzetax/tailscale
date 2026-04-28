@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package driveimpl
@@ -415,7 +415,7 @@ var writeMethods = map[string]bool{
 	"DELETE":    true,
 }
 
-// canSudo checks wether we can sudo -u the configured executable as the
+// canSudo checks whether we can sudo -u the configured executable as the
 // configured user by attempting to call the executable with the '-h' flag to
 // print help.
 func (s *userServer) canSudo() bool {

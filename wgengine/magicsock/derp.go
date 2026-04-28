@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package magicsock
@@ -6,6 +6,7 @@ package magicsock
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"maps"
 	"net"
@@ -216,17 +217,28 @@ func (c *Conn) derpRegionCodeLocked(regionID int) string {
 	return ""
 }
 
+// setHomeDERPGaugeLocked updates the home DERP gauge metric.
+//
+// c.mu must be held.
+func (c *Conn) setHomeDERPGaugeLocked(derpNum int) {
+	if c.homeDERPGauge != nil {
+		c.homeDERPGauge.Set(float64(derpNum))
+	}
+}
+
 // c.mu must NOT be held.
 func (c *Conn) setNearestDERP(derpNum int) (wantDERP bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if !c.wantDerpLocked() {
 		c.myDerp = 0
+		c.setHomeDERPGaugeLocked(0)
 		c.health.SetMagicSockDERPHome(0, c.homeless)
 		return false
 	}
 	if c.homeless {
 		c.myDerp = 0
+		c.setHomeDERPGaugeLocked(0)
 		c.health.SetMagicSockDERPHome(0, c.homeless)
 		return false
 	}
@@ -238,6 +250,7 @@ func (c *Conn) setNearestDERP(derpNum int) (wantDERP bool) {
 		metricDERPHomeChange.Add(1)
 	}
 	c.myDerp = derpNum
+	c.setHomeDERPGaugeLocked(derpNum)
 	c.health.SetMagicSockDERPHome(derpNum, c.homeless)
 
 	if c.privateKey.IsZero() {
@@ -380,6 +393,9 @@ func (c *Conn) derpWriteChanForRegion(regionID int, peer key.NodePublic) chan de
 		return derpMap.Regions[regionID]
 	})
 	dc.HealthTracker = c.health
+	if c.extraRootCAs != nil {
+		dc.TLSConfig = &tls.Config{RootCAs: c.extraRootCAs}
+	}
 
 	dc.SetCanAckPings(true)
 	dc.NotePreferred(c.myDerp == regionID)
@@ -424,7 +440,14 @@ func (c *Conn) derpWriteChanForRegion(regionID int, peer key.NodePublic) chan de
 
 	go c.runDerpReader(ctx, regionID, dc, wg, startGate)
 	go c.runDerpWriter(ctx, dc, ch, wg, startGate)
-	go c.derpActiveFunc()
+	go func() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-startGate:
+			c.derpActiveFunc()
+		}
+	}()
 
 	return ad.writeCh
 }
@@ -706,6 +729,10 @@ func (c *Conn) processDERPReadResult(dm derpReadResult, b []byte) (n int, ep *en
 		return 0, nil
 	}
 
+	if c.onDERPRecv != nil && c.onDERPRecv(regionID, dm.src, b[:n]) {
+		return 0, nil
+	}
+
 	var ok bool
 	c.mu.Lock()
 	ep, ok = c.peerMap.endpointForNodeKey(dm.src)
@@ -724,6 +751,15 @@ func (c *Conn) processDERPReadResult(dm derpReadResult, b []byte) (n int, ep *en
 	c.metrics.inboundPacketsDERPTotal.Add(1)
 	c.metrics.inboundBytesDERPTotal.Add(int64(n))
 	return n, ep
+}
+
+// SendDERPPacketTo sends an arbitrary packet to the given node key via
+// the DERP relay for the given region. It creates the DERP connection
+// to the region if one doesn't already exist.
+func (c *Conn) SendDERPPacketTo(dstKey key.NodePublic, regionID int, pkt []byte) (sent bool, err error) {
+	return c.sendAddr(
+		netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, uint16(regionID)),
+		dstKey, pkt, false, false)
 }
 
 // SetOnlyTCP443 set whether the magicsock connection is restricted

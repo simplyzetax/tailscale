@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package netcheck checks the network conditions from the current host.
@@ -235,7 +235,7 @@ type Client struct {
 	testEnoughRegions      int
 	testCaptivePortalDelay time.Duration
 
-	mu       sync.Mutex            // guards following
+	mu       syncs.Mutex           // guards following
 	nextFull bool                  // do a full region scan, even if last != nil
 	prev     map[time.Time]*Report // some previous reports
 	last     *Report               // most recent report
@@ -545,7 +545,7 @@ func makeProbePlanInitial(dm *tailcfg.DERPMap, ifState *netmon.State) (plan prob
 
 		var p4 []probe
 		var p6 []probe
-		for try := 0; try < 3; try++ {
+		for try := range 3 {
 			n := reg.Nodes[try%len(reg.Nodes)]
 			delay := time.Duration(try) * defaultInitialRetransmitTime
 			if n.IPv4 != "none" && ((ifState.HaveV4 && nodeMight4(n)) || n.IsTestNode()) {
@@ -597,7 +597,7 @@ type reportState struct {
 	stopProbeCh chan struct{}
 	waitPortMap sync.WaitGroup
 
-	mu       sync.Mutex
+	mu       syncs.Mutex
 	report   *Report                            // to be returned by GetReport
 	inFlight map[stun.TxID]func(netip.AddrPort) // called without c.mu held
 	gotEP4   netip.AddrPort
@@ -975,13 +975,11 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 				// need to close the underlying Pinger after a timeout
 				// or when all ICMP probes are done, regardless of
 				// whether the HTTPS probes have finished.
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
+				wg.Go(func() {
 					if err := c.measureAllICMPLatency(ctx, rs, need); err != nil {
 						c.logf("[v1] measureAllICMPLatency: %v", err)
 					}
-				}()
+				})
 			}
 			wg.Add(len(need))
 			c.logf("netcheck: UDP is blocked, trying HTTPS")
@@ -993,9 +991,9 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 					c.logf("[v1] netcheck: measuring HTTPS latency of %v (%d): %v", reg.RegionCode, reg.RegionID, err)
 				} else {
 					rs.mu.Lock()
-					if l, ok := rs.report.RegionLatency[reg.RegionID]; !ok {
+					if latency, ok := rs.report.RegionLatency[reg.RegionID]; !ok {
 						mak.Set(&rs.report.RegionLatency, reg.RegionID, d)
-					} else if l >= d {
+					} else if latency >= d {
 						rs.report.RegionLatency[reg.RegionID] = d
 					}
 					// We set these IPv4 and IPv6 but they're not really used
@@ -1072,9 +1070,7 @@ func (c *Client) runHTTPOnlyChecks(ctx context.Context, last *Report, rs *report
 		if len(rg.Nodes) == 0 {
 			continue
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			node := rg.Nodes[0]
 			req, _ := http.NewRequestWithContext(ctx, "HEAD", "https://"+node.HostName+"/derp/probe", nil)
 			// One warm-up one to get HTTP connection set
@@ -1099,7 +1095,7 @@ func (c *Client) runHTTPOnlyChecks(ctx context.Context, last *Report, rs *report
 			}
 			d := c.timeNow().Sub(t0)
 			rs.addNodeLatency(node, netip.AddrPort{}, d)
-		}()
+		})
 	}
 	wg.Wait()
 	return nil
@@ -1214,9 +1210,9 @@ func (c *Client) measureAllICMPLatency(ctx context.Context, rs *reportState, nee
 			} else if ok {
 				c.logf("[v1] ICMP latency of %v (%d): %v", reg.RegionCode, reg.RegionID, d)
 				rs.mu.Lock()
-				if l, ok := rs.report.RegionLatency[reg.RegionID]; !ok {
+				if latency, ok := rs.report.RegionLatency[reg.RegionID]; !ok {
 					mak.Set(&rs.report.RegionLatency, reg.RegionID, d)
-				} else if l >= d {
+				} else if latency >= d {
 					rs.report.RegionLatency[reg.RegionID] = d
 				}
 

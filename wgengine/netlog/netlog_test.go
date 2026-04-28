@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !ts_omit_netlog && !ts_omit_logtail
@@ -182,6 +182,7 @@ func TestUpdateRace(t *testing.T) {
 	group.Wait()
 	logger.mu.Lock()
 	close(logger.recordsChan)
+	logger.recordsChan = nil
 	logger.mu.Unlock()
 }
 

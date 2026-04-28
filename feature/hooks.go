@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package feature
@@ -6,6 +6,8 @@ package feature
 import (
 	"net/http"
 	"net/url"
+	"os"
+	"sync"
 
 	"tailscale.com/types/logger"
 	"tailscale.com/types/persist"
@@ -15,9 +17,16 @@ import (
 // to conditionally initialize.
 var HookCanAutoUpdate Hook[func() bool]
 
+var testAllowAutoUpdate = sync.OnceValue(func() bool {
+	return os.Getenv("TS_TEST_ALLOW_AUTO_UPDATE") == "1"
+})
+
 // CanAutoUpdate reports whether the current binary is built with auto-update
 // support and, if so, whether the current platform supports it.
 func CanAutoUpdate() bool {
+	if testAllowAutoUpdate() {
+		return true
+	}
 	if f, ok := HookCanAutoUpdate.GetOk(); ok {
 		return f()
 	}
@@ -57,6 +66,11 @@ func TPMAvailable() bool {
 	}
 	return false
 }
+
+// HookGetSSHHostKeyPublicStrings is a hook for the ssh/hostkeys package to
+// provide SSH host key public strings to ipn/ipnlocal without ipnlocal needing
+// to import golang.org/x/crypto/ssh.
+var HookGetSSHHostKeyPublicStrings Hook[func(varRoot string, logf logger.Logf) ([]string, error)]
 
 // HookHardwareAttestationAvailable is a hook that reports whether hardware
 // attestation is supported and available.

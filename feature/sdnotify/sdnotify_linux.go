@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux && !android
@@ -29,8 +29,8 @@ type logOnce struct {
 	sync.Once
 }
 
-func (l *logOnce) logf(format string, args ...any) {
-	l.Once.Do(func() {
+func (lg *logOnce) logf(format string, args ...any) {
+	lg.Once.Do(func() {
 		log.Printf(format, args...)
 	})
 }

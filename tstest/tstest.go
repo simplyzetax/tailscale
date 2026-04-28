@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package tstest provides utilities for use in unit tests.
@@ -6,6 +6,7 @@ package tstest
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -19,8 +20,22 @@ import (
 	"tailscale.com/util/cibuild"
 )
 
+// AssertNotParallel asserts that t has not been marked as parallel.
+// It panics (via t.Setenv) if t.Parallel has already been called.
+//
+// Use this when a test modifies package-level globals or other shared
+// state that would be unsafe to modify concurrently with other tests.
+func AssertNotParallel(t testing.TB) {
+	t.Helper()
+	t.Setenv("ASSERT_NOT_PARALLEL_TEST", "1") // panics if t.Parallel was called
+}
+
 // Replace replaces the value of target with val.
 // The old value is restored when the test ends.
+//
+// When target is a package-level variable, the caller should also call
+// [AssertNotParallel] to ensure the test is not running in parallel with
+// other tests that may access the same variable.
 func Replace[T any](t testing.TB, target *T, val T) {
 	t.Helper()
 	if target == nil {
@@ -91,5 +106,30 @@ var serializeParallel = envknob.RegisterBool("TS_SERIAL_TESTS")
 func Parallel(t *testing.T) {
 	if !serializeParallel() {
 		t.Parallel()
+	}
+}
+
+// RequireRoot skips the test if the current user is not root.
+func RequireRoot(tb testing.TB) {
+	tb.Helper()
+	if os.Getuid() != 0 {
+		tb.Skip("skipping test; requires root")
+	}
+}
+
+// SkipOnKernelVersions skips the test if the current
+// kernel version is in the specified list.
+func SkipOnKernelVersions(t testing.TB, issue string, versions ...string) {
+	major, minor, patch := KernelVersion()
+	if major == 0 && minor == 0 && patch == 0 {
+		t.Logf("could not determine kernel version")
+		return
+	}
+
+	current := fmt.Sprintf("%d.%d.%d", major, minor, patch)
+	for _, v := range versions {
+		if v == current {
+			t.Skipf("skipping on kernel version %q - see issue %s", current, issue)
+		}
 	}
 }

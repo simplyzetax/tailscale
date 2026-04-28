@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux
@@ -126,8 +126,6 @@ func TestAddAndDeleteBase(t *testing.T) {
 
 	// Check that the rules were created.
 	tsRulesV4 := []fakeRule{ // table/chain/rule
-		{"filter", "ts-input", []string{"!", "-i", tunname, "-s", tsaddr.ChromeOSVMRange().String(), "-j", "RETURN"}},
-		{"filter", "ts-input", []string{"!", "-i", tunname, "-s", tsaddr.CGNATRange().String(), "-j", "DROP"}},
 		{"filter", "ts-forward", []string{"-o", tunname, "-s", tsaddr.CGNATRange().String(), "-j", "DROP"}},
 	}
 
@@ -362,5 +360,198 @@ func checkSNATRuleCount(t *testing.T, iptr *iptablesRunner, ip netip.Addr, wants
 	}
 	if len(rules) != wantsRules {
 		t.Fatalf("wants %d rules, got %d", wantsRules, len(rules))
+	}
+}
+
+func TestAddAndDelConnmarkSaveRule(t *testing.T) {
+	preroutingArgs := []string{
+		"-m", "conntrack",
+		"--ctstate", "ESTABLISHED,RELATED",
+		"-j", "CONNMARK",
+		"--restore-mark",
+		"--nfmask", "0xff0000",
+		"--ctmask", "0xff0000",
+	}
+
+	outputArgs := []string{
+		"-m", "conntrack",
+		"--ctstate", "NEW",
+		"-m", "mark",
+		"!", "--mark", "0x0/0xff0000",
+		"-j", "CONNMARK",
+		"--save-mark",
+		"--nfmask", "0xff0000",
+		"--ctmask", "0xff0000",
+	}
+
+	t.Run("with_ipv6", func(t *testing.T) {
+		iptr := newFakeIPTablesRunner()
+
+		// Add connmark rules
+		if err := iptr.AddConnmarkSaveRule(); err != nil {
+			t.Fatalf("AddConnmarkSaveRule failed: %v", err)
+		}
+
+		// Verify rules exist in both IPv4 and IPv6
+		for _, proto := range []iptablesInterface{iptr.ipt4, iptr.ipt6} {
+			if exists, err := proto.Exists("mangle", "PREROUTING", preroutingArgs...); err != nil {
+				t.Fatalf("error checking PREROUTING rule: %v", err)
+			} else if !exists {
+				t.Errorf("PREROUTING connmark rule doesn't exist")
+			}
+
+			if exists, err := proto.Exists("mangle", "OUTPUT", outputArgs...); err != nil {
+				t.Fatalf("error checking OUTPUT rule: %v", err)
+			} else if !exists {
+				t.Errorf("OUTPUT connmark rule doesn't exist")
+			}
+		}
+
+		// Test idempotency - calling AddConnmarkSaveRule again should not fail or duplicate
+		if err := iptr.AddConnmarkSaveRule(); err != nil {
+			t.Fatalf("AddConnmarkSaveRule (second call) failed: %v", err)
+		}
+
+		// Verify rules still exist and weren't duplicated
+		for _, proto := range []iptablesInterface{iptr.ipt4, iptr.ipt6} {
+			preroutingRules, err := proto.List("mangle", "PREROUTING")
+			if err != nil {
+				t.Fatalf("error listing PREROUTING rules: %v", err)
+			}
+			connmarkCount := 0
+			for _, rule := range preroutingRules {
+				if strings.Contains(rule, "CONNMARK") && strings.Contains(rule, "restore-mark") {
+					connmarkCount++
+				}
+			}
+			if connmarkCount != 1 {
+				t.Errorf("expected 1 PREROUTING connmark rule, got %d", connmarkCount)
+			}
+		}
+
+		// Delete connmark rules
+		if err := iptr.DelConnmarkSaveRule(); err != nil {
+			t.Fatalf("DelConnmarkSaveRule failed: %v", err)
+		}
+
+		// Verify rules are deleted
+		for _, proto := range []iptablesInterface{iptr.ipt4, iptr.ipt6} {
+			if exists, err := proto.Exists("mangle", "PREROUTING", preroutingArgs...); err != nil {
+				t.Fatalf("error checking PREROUTING rule: %v", err)
+			} else if exists {
+				t.Errorf("PREROUTING connmark rule still exists after deletion")
+			}
+
+			if exists, err := proto.Exists("mangle", "OUTPUT", outputArgs...); err != nil {
+				t.Fatalf("error checking OUTPUT rule: %v", err)
+			} else if exists {
+				t.Errorf("OUTPUT connmark rule still exists after deletion")
+			}
+		}
+
+		// Test idempotency of deletion
+		if err := iptr.DelConnmarkSaveRule(); err != nil {
+			t.Fatalf("DelConnmarkSaveRule (second call) failed: %v", err)
+		}
+	})
+
+	t.Run("without_ipv6", func(t *testing.T) {
+		// Create an iptables runner with only IPv4 (simulating system without IPv6)
+		iptr := &iptablesRunner{
+			ipt4:              newFakeIPTables(),
+			ipt6:              nil, // IPv6 not available
+			v6Available:       false,
+			v6NATAvailable:    false,
+			v6FilterAvailable: false,
+		}
+
+		// Add connmark rules should NOT panic with nil ipt6
+		if err := iptr.AddConnmarkSaveRule(); err != nil {
+			t.Fatalf("AddConnmarkSaveRule failed with IPv6 disabled: %v", err)
+		}
+
+		// Verify rules exist ONLY in IPv4
+		if exists, err := iptr.ipt4.Exists("mangle", "PREROUTING", preroutingArgs...); err != nil {
+			t.Fatalf("error checking IPv4 PREROUTING rule: %v", err)
+		} else if !exists {
+			t.Errorf("IPv4 PREROUTING connmark rule doesn't exist")
+		}
+
+		if exists, err := iptr.ipt4.Exists("mangle", "OUTPUT", outputArgs...); err != nil {
+			t.Fatalf("error checking IPv4 OUTPUT rule: %v", err)
+		} else if !exists {
+			t.Errorf("IPv4 OUTPUT connmark rule doesn't exist")
+		}
+
+		// Delete connmark rules should NOT panic with nil ipt6
+		if err := iptr.DelConnmarkSaveRule(); err != nil {
+			t.Fatalf("DelConnmarkSaveRule failed with IPv6 disabled: %v", err)
+		}
+
+		// Verify rules are deleted from IPv4
+		if exists, err := iptr.ipt4.Exists("mangle", "PREROUTING", preroutingArgs...); err != nil {
+			t.Fatalf("error checking IPv4 PREROUTING rule: %v", err)
+		} else if exists {
+			t.Errorf("IPv4 PREROUTING connmark rule still exists after deletion")
+		}
+
+		if exists, err := iptr.ipt4.Exists("mangle", "OUTPUT", outputArgs...); err != nil {
+			t.Fatalf("error checking IPv4 OUTPUT rule: %v", err)
+		} else if exists {
+			t.Errorf("IPv4 OUTPUT connmark rule still exists after deletion")
+		}
+	})
+}
+
+func TestAddAndDelCGNATRules(t *testing.T) {
+	iptr := newFakeIPTablesRunner()
+	tunname := "tun0"
+
+	// We need the chains to exist so we can add rules into them.
+	if err := iptr.AddChains(); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		mode      CGNATMode
+		wantRules []fakeRule
+	}{
+		{
+			CGNATModeDrop, []fakeRule{
+				{"filter", "ts-input", []string{"!", "-i", tunname, "-s", tsaddr.ChromeOSVMRange().String(), "-j", "RETURN"}},
+				{"filter", "ts-input", []string{"!", "-i", tunname, "-s", tsaddr.CGNATRange().String(), "-j", "DROP"}},
+			},
+		},
+		{
+			CGNATModeReturn, []fakeRule{
+				{"filter", "ts-input", []string{"!", "-i", tunname, "-s", tsaddr.CGNATRange().String(), "-j", "RETURN"}},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		if err := iptr.AddExternalCGNATRules(tt.mode, tunname); err != nil {
+			t.Fatal(err)
+		}
+
+		for _, tr := range tt.wantRules {
+			if exists, err := iptr.ipt4.Exists(tr.table, tr.chain, tr.args...); err != nil {
+				t.Fatalf("mode %q: error checking for rule: %v", tt.mode, err)
+			} else if !exists {
+				t.Errorf("mode %q: rule %s/%s/%s doesn't exist", tt.mode, tr.table, tr.chain, strings.Join(tr.args, " "))
+			}
+		}
+
+		if err := iptr.DelExternalCGNATRules(tt.mode, tunname); err != nil {
+			t.Fatal(err)
+		}
+
+		for _, tr := range tt.wantRules {
+			if exists, err := iptr.ipt4.Exists(tr.table, tr.chain, tr.args...); err != nil {
+				t.Fatalf("mode %q: error checking for rule: %v", tt.mode, err)
+			} else if exists {
+				t.Errorf("mode %q: rule %s/%s/%s not deleted", tt.mode, tr.table, tr.chain, strings.Join(tr.args, " "))
+			}
+		}
 	}
 }

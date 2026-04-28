@@ -1,6 +1,6 @@
 //go:build js && wasm
 
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // The wasm package builds a WebAssembly module that provides a subset of
@@ -114,6 +114,7 @@ func newIPN(jsConfig js.Value) map[string]any {
 		SetSubsystem:  sys.Set,
 		ControlKnobs:  sys.ControlKnobs(),
 		HealthTracker: sys.HealthTracker.Get(),
+		ExtraRootCAs:  sys.ExtraRootCAs,
 		Metrics:       sys.UserMetricsRegistry(),
 		EventBus:      sys.Bus.Get(),
 	})
@@ -276,7 +277,7 @@ func (i *jsIPN) run(jsCallbacks js.Value) {
 			jsNetMap := jsNetMap{
 				Self: jsNetMapSelfNode{
 					jsNetMapNode: jsNetMapNode{
-						Name:       nm.Name,
+						Name:       nm.SelfName(),
 						Addresses:  mapSliceView(nm.GetAddresses(), func(a netip.Prefix) string { return a.Addr().String() }),
 						NodeKey:    nm.NodeKey.String(),
 						MachineKey: nm.MachineKey.String(),
