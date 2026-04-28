@@ -12,6 +12,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/hex"
@@ -23,7 +24,9 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall/js"
 	"time"
 
@@ -151,12 +154,15 @@ func newIPN(jsConfig js.Value) map[string]any {
 	ipnObj := &jsIPN{
 		dialer:     dialer,
 		eng:        eng,
+		ns:         ns,
 		srv:        srv,
 		lb:         lb,
 		controlURL: controlURL,
 		authKey:    authKey,
 		hostname:   hostname,
+		routes:     map[string]js.Value{},
 	}
+	ns.GetTCPHandlerForFlow = ipnObj.getTCPHandlerForFlow
 
 	return map[string]any{
 		"run": js.FuncOf(func(this js.Value, args []js.Value) any {
@@ -189,6 +195,14 @@ func newIPN(jsConfig js.Value) map[string]any {
 			ipnObj.logout()
 			return nil
 		}),
+		"route": js.FuncOf(func(this js.Value, args []js.Value) any {
+			if len(args) != 2 {
+				log.Printf("Usage: route(path, handler)")
+				return nil
+			}
+			ipnObj.route(args[0].String(), args[1])
+			return nil
+		}),
 		"ssh": js.FuncOf(func(this js.Value, args []js.Value) any {
 			if len(args) != 3 {
 				log.Printf("Usage: ssh(hostname, userName, termConfig)")
@@ -213,11 +227,14 @@ type jsIPN struct {
 	lastNetmapJSON string
 	dialer         *tsdial.Dialer
 	eng            wgengine.Engine
+	ns             *netstack.Impl
 	srv            *ipnserver.Server
 	lb             *ipnlocal.LocalBackend
 	controlURL     string
 	authKey        string
 	hostname       string
+	routesMu       sync.RWMutex
+	routes         map[string]js.Value
 }
 
 var jsIPNState = map[ipn.State]string{
@@ -416,6 +433,171 @@ func (i *jsIPN) logout() {
 		defer cancel()
 		i.lb.Logout(ctx, ipnauth.Self)
 	}()
+}
+
+func (i *jsIPN) route(path string, handler js.Value) {
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	if handler.Type() != js.TypeFunction {
+		log.Printf("route(%q): handler must be a function", path)
+		return
+	}
+	i.routesMu.Lock()
+	defer i.routesMu.Unlock()
+	i.routes[path] = handler
+}
+
+func (i *jsIPN) getTCPHandlerForFlow(src, dst netip.AddrPort) (func(net.Conn), bool) {
+	i.routesMu.RLock()
+	hasRoutes := len(i.routes) > 0
+	i.routesMu.RUnlock()
+	if dst.Port() != 80 || !hasRoutes {
+		return nil, false
+	}
+	return func(c net.Conn) {
+		defer c.Close()
+		i.handleRouteConn(c, src, dst)
+	}, true
+}
+
+func (i *jsIPN) handleRouteConn(c net.Conn, src, dst netip.AddrPort) {
+	req, err := http.ReadRequest(bufio.NewReader(c))
+	if err != nil {
+		log.Printf("route: could not read HTTP request: %v", err)
+		writeHTTPResponse(c, 400, "Bad Request", nil, []byte("Bad Request"))
+		return
+	}
+	defer req.Body.Close()
+
+	i.routesMu.RLock()
+	handler, ok := i.routes[req.URL.Path]
+	i.routesMu.RUnlock()
+	if !ok {
+		writeHTTPResponse(c, 404, "Not Found", nil, []byte("Not Found"))
+		return
+	}
+
+	headers := map[string]any{}
+	for k, values := range req.Header {
+		if len(values) > 0 {
+			headers[k] = values[0]
+		}
+	}
+
+	host := req.Host
+	if host == "" {
+		host = dst.String()
+	}
+	routeReq := map[string]any{
+		"method":          req.Method,
+		"url":             "http://" + host + req.URL.RequestURI(),
+		"path":            req.URL.Path,
+		"headers":         headers,
+		"sourceIP":        src.Addr().String(),
+		"sourcePort":      int(src.Port()),
+		"destinationIP":   dst.Addr().String(),
+		"destinationPort": int(dst.Port()),
+	}
+
+	res, err := awaitJS(handler.Invoke(routeReq))
+	if err != nil {
+		log.Printf("route %q: handler failed: %v", req.URL.Path, err)
+		writeHTTPResponse(c, 500, "Internal Server Error", nil, []byte("Internal Server Error"))
+		return
+	}
+
+	status, statusText, responseHeaders, body, err := readJSResponse(res)
+	if err != nil {
+		log.Printf("route %q: invalid response: %v", req.URL.Path, err)
+		writeHTTPResponse(c, 500, "Internal Server Error", nil, []byte("Internal Server Error"))
+		return
+	}
+	writeHTTPResponse(c, status, statusText, responseHeaders, body)
+}
+
+func readJSResponse(res js.Value) (int, string, map[string]string, []byte, error) {
+	if res.IsUndefined() || res.IsNull() {
+		return 204, "No Content", nil, nil, nil
+	}
+
+	status := 200
+	if v := res.Get("status"); v.Type() == js.TypeNumber {
+		status = v.Int()
+	}
+	statusText := http.StatusText(status)
+	if v := res.Get("statusText"); v.Type() == js.TypeString && v.String() != "" {
+		statusText = v.String()
+	}
+
+	headers := map[string]string{}
+	copyJSHeaders(headers, res.Get("headers"))
+
+	var body []byte
+	if text := res.Get("text"); text.Type() == js.TypeFunction {
+		textValue, err := awaitJS(res.Call("text"))
+		if err != nil {
+			return 0, "", nil, nil, err
+		}
+		if !textValue.IsNull() && !textValue.IsUndefined() {
+			body = []byte(textValue.String())
+		}
+	} else if v := res.Get("body"); v.Type() == js.TypeString {
+		body = []byte(v.String())
+	}
+
+	return status, statusText, headers, body, nil
+}
+
+func copyJSHeaders(dst map[string]string, headers js.Value) {
+	if headers.IsUndefined() || headers.IsNull() {
+		return
+	}
+
+	if forEach := headers.Get("forEach"); forEach.Type() == js.TypeFunction {
+		cb := js.FuncOf(func(this js.Value, args []js.Value) any {
+			if len(args) >= 2 {
+				dst[args[1].String()] = args[0].String()
+			}
+			return nil
+		})
+		defer cb.Release()
+		headers.Call("forEach", cb)
+		return
+	}
+
+	keys := jsGlobal.Get("Object").Call("keys", headers)
+	for j := 0; j < keys.Length(); j++ {
+		k := keys.Index(j).String()
+		v := headers.Get(k)
+		if v.Type() == js.TypeString {
+			dst[k] = v.String()
+		}
+	}
+}
+
+func writeHTTPResponse(w io.Writer, status int, statusText string, headers map[string]string, body []byte) {
+	if statusText == "" {
+		statusText = http.StatusText(status)
+	}
+	if headers == nil {
+		headers = map[string]string{}
+	}
+	if _, ok := headers["content-length"]; !ok {
+		headers["content-length"] = strconv.Itoa(len(body))
+	}
+	if _, ok := headers["connection"]; !ok {
+		headers["connection"] = "close"
+	}
+
+	fmt.Fprintf(w, "HTTP/1.1 %d %s\r\n", status, statusText)
+	for k, v := range headers {
+		fmt.Fprintf(w, "%s: %s\r\n", k, v)
+	}
+	fmt.Fprint(w, "\r\n")
+	if len(body) > 0 {
+		w.Write(body)
+	}
 }
 
 func (i *jsIPN) ssh(host, username string, termConfig js.Value) map[string]any {
@@ -791,6 +973,46 @@ func makePromise(f func() (any, error)) js.Value {
 		return nil
 	})
 	return jsGlobal.Get("Promise").New(handler)
+}
+
+func awaitJS(v js.Value) (js.Value, error) {
+	if v.IsUndefined() || v.IsNull() {
+		return v, nil
+	}
+
+	then := v.Get("then")
+	if then.Type() != js.TypeFunction {
+		return v, nil
+	}
+
+	type result struct {
+		value js.Value
+		err   error
+	}
+	done := make(chan result, 1)
+
+	resolve := js.FuncOf(func(this js.Value, args []js.Value) any {
+		if len(args) == 0 {
+			done <- result{value: js.Undefined()}
+		} else {
+			done <- result{value: args[0]}
+		}
+		return nil
+	})
+	reject := js.FuncOf(func(this js.Value, args []js.Value) any {
+		if len(args) == 0 {
+			done <- result{err: fmt.Errorf("promise rejected")}
+		} else {
+			done <- result{err: fmt.Errorf("%s", args[0].String())}
+		}
+		return nil
+	})
+	defer resolve.Release()
+	defer reject.Release()
+
+	v.Call("then", resolve, reject)
+	res := <-done
+	return res.value, res.err
 }
 
 const logPolicyStateKey = "log-policy"

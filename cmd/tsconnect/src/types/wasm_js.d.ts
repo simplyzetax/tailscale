@@ -25,6 +25,9 @@ declare global {
     login(): void
     logout(): void
 
+    /** Register a plain HTTP route served on this node's tailnet IP */
+    route(path: string, handler: IPNRouteHandler): void
+
     /** Start a Tailscale SSH session */
     ssh(
       host: string,
@@ -56,6 +59,19 @@ declare global {
   interface IPNSSHSession {
     resize(rows: number, cols: number): boolean
     close(): boolean
+  }
+
+  type IPNRouteHandler = (request: IPNRouteRequest) => Response | IPNResponse | Promise<Response | IPNResponse>
+
+  type IPNRouteRequest = {
+    method: string
+    url: string
+    path: string
+    headers: Record<string, string>
+    sourceIP: string
+    sourcePort: number
+    destinationIP: string
+    destinationPort: number
   }
 
   interface IPNStateStorage {
